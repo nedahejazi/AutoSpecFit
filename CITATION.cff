@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+title: "AutoSpecFit"
+message: "If you use AutoSpecFit, please cite the software repository and the associated publications."
+type: software
+authors:
+  - family-names: Hejazi
+    given-names: Neda
+version: "1.0"
+date-released: "2026-06-22"
+abstract: "AutoSpecFit is an automated line-by-line spectral fitting framework for high-resolution chemical abundance measurements of cool stars."
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Hejazi
+      given-names: Neda
+    - family-names: Lépine
+      given-names: Sébastien
+    - family-names: Nordlander
+      given-names: Thomas
+    - family-names: Jao
+      given-names: Wei-Chun
+    - family-names: Coria
+      given-names: Diego R.
+    - family-names: Lester
+      given-names: Kathryn V.
+  title: "Abundance Measurements of the Metal-poor M Subdwarf LHS 174 Using High-resolution Optical Spectroscopy"
+  journal: "The Astronomical Journal"
+  year: 2025
+  volume: 170
+  issue: 18
+  doi: "10.3847/1538-3881/add696"
+references:
+  - type: article
+    authors:
+      - family-names: Hejazi
+        given-names: Neda
+    title: "High-resolution Elemental Abundance Measurements of Cool JWST Planet Hosts Using AutoSpecFit: Application to the Sub-Neptune K2-18b's Host M dwarf"
+    journal: "The Astrophysical Journal"
+    year: 2024
+    volume: 973
+    issue: 31
+    doi: "10.3847/1538-4357/ad61dc"
