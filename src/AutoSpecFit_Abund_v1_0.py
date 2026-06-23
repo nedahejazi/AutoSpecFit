@@ -437,9 +437,9 @@ class AutoSpecFitConfig:
     # Standard convergence requires all species to change by <=
     # convergence_tolerance. If exactly one species remains non-converged while
     # all other species satisfy this threshold, ASF treats that species as an
-    # oscillating element and adopts the average of its finite iteration
-    # abundances as the final value.
-    convergence_tolerance: float = 0.03
+    # oscillating element and adopts the average of its final two finite
+    # iteration abundances as the final value.
+    convergence_tolerance: float = 0.035
 
     # ------------------------------------------------------------------
     # AutoSpecNorm and model-smoothing settings
@@ -1577,7 +1577,8 @@ def evaluate_convergence_status(
 
     # Oscillation exception: all species except one satisfy the strict
     # tolerance. The remaining species is treated as oscillating and its final
-    # abundance is taken as the average over its finite iteration history.
+    # abundance is taken as the average of its final two finite iteration
+    # abundances.
     if n_converged == n_species - 1:
         oscillating_index = int(np.where(~converged_mask)[0][0])
         return True, True, oscillating_index
@@ -1743,7 +1744,7 @@ def run_autospecfit_abundance_pipeline(
             # Stop when either standard convergence is reached or when only
             # one species remains non-converged. In the latter case, ASF
             # treats that species as oscillating and adopts the average of its
-            # finite iteration abundances as the final value.
+            # final two finite iteration abundances as the final value.
             change = np.abs(mean_history[:, iteration_id - 1] - mean_history[:, iteration_id - 2])
             converged, has_oscillating_species, oscillating_index = evaluate_convergence_status(
                 change,
@@ -1761,8 +1762,8 @@ def run_autospecfit_abundance_pipeline(
                     ]
                     finite_history = finite_history[np.isfinite(finite_history)]
 
-                    if len(finite_history) > 0:
-                        averaged_value = float(np.mean(finite_history))
+                    if len(finite_history) >= 2:
+                        averaged_value = float(np.mean(finite_history[-2:]))
                         final_not_rounded[oscillating_index] = averaged_value
                         final_rounded[oscillating_index] = np.round(averaged_value, 2)
 
@@ -1771,8 +1772,22 @@ def run_autospecfit_abundance_pipeline(
                             f"remained non-converged while all other species "
                             f"satisfied the convergence tolerance; final "
                             f"{oscillating_element} abundance set to the "
-                            f"average of finite iteration values "
-                            f"({averaged_value:+.3f})."
+                            f"average of the final two finite iteration values "
+                            f"({finite_history[-2]:+.3f}, {finite_history[-1]:+.3f}; "
+                            f"mean = {averaged_value:+.3f})."
+                        )
+                    elif len(finite_history) == 1:
+                        averaged_value = float(finite_history[-1])
+                        final_not_rounded[oscillating_index] = averaged_value
+                        final_rounded[oscillating_index] = np.round(averaged_value, 2)
+
+                        note = (
+                            f"Iteration {iteration_id}: {oscillating_element} "
+                            f"remained non-converged while all other species "
+                            f"satisfied the convergence tolerance; only one "
+                            f"finite iteration value was available, so final "
+                            f"{oscillating_element} abundance was set to "
+                            f"{averaged_value:+.3f}."
                         )
                         LOGGER.warning(note)
                         log_handle.write(f"# {note}\n")
