@@ -81,26 +81,34 @@ Future ASF versions will include iterative stellar-parameter optimization.
 
 ## Abundance Scale and Conversion to [X/H]
 
-Abundances reported by ASF correspond to abundance offsets relative to the metallicity of the adopted model atmosphere. They are not direct `[X/H]` abundances.
+Abundances reported by ASF correspond to abundance offsets relative to the chemical composition of the adopted model atmosphere. They are therefore not direct `[X/H]` abundances.
 
-The final abundance of an element should be calculated as:
+For non-alpha elements, the final abundance is computed as:
 
 ```text
 [X/H] = [M/H]input + ASF(X)
 ```
 
-where `ASF(X)` is the abundance offset measured by ASF for element `X`, and `[M/H]input` is the metallicity supplied by the user and adopted for the model atmosphere.
-
-For example:
+For alpha elements (e.g., O, Mg, Si, Ca, and Ti), the alpha enhancement adopted in the model atmosphere must also be included:
 
 ```text
-[M/H]input = -0.30
-ASF(Mg)    = +0.15
-
-[Mg/H] = -0.30 + 0.15 = -0.15
+[X/H] = [M/H]input + [alpha/Fe]input + ASF(X)
 ```
 
-The abundance notation and formulation follow Hejazi et al. (2025).
+where `ASF(X)` is the abundance offset measured by ASF for element `X`, `[M/H]input` is the metallicity supplied by the user and adopted in the model atmosphere, and `[alpha/Fe]input` is the alpha-element enhancement adopted in the model atmosphere.
+
+For example, for magnesium (Mg), which is an alpha element:
+
+```text
+[M/H]input      = -0.30
+[alpha/Fe]input = +0.12
+ASF(Mg)         = +0.15
+
+[Mg/H] = -0.30 + 0.12 + 0.15 = -0.03
+```
+
+This abundance formulation follows Equation 4 of Hejazi et al. (2025, AJ, 170, 18; DOI: 10.3847/1538-3881/add696).
+
 
 ---
 
