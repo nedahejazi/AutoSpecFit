@@ -134,7 +134,11 @@ Additional ASF applications are currently in preparation.
 
 
 Abundance Scale and Conversion to [X/H]
+<<<<<<< HEAD
 ------------------------------------
+=======
+--------------------------------------
+>>>>>>> ccc4ee4 (Add late-iteration fallback convergence analysis)
 ASF abundances are reported as abundance offsets that must be combined with the
 abundance pattern adopted in the input model atmosphere to obtain abundances on
 the standard [X/H] scale.
@@ -149,8 +153,13 @@ in the model atmosphere must also be included:
 [X/H] = [M/H]input + [alpha/Fe]input + ASF(X)
 
 where ASF(X) is the abundance offset measured by ASF for element X, [M/H]input is
+<<<<<<< HEAD
 the input metallicity supplied by the user, and [alpha/Fe]input is the input alpha-element
 enhancement also provided by the user.
+=======
+the input metallicity supplied by the user, and [alpha/Fe]input is the input
+alpha-element enhancement also provided by the user.
+>>>>>>> ccc4ee4 (Add late-iteration fallback convergence analysis)
 
 For example, for magnesium (Mg), which is an alpha element:
 
@@ -418,8 +427,10 @@ class AutoSpecFitConfig:
     # ------------------------------------------------------------------
 
     # The first abundance iteration is run separately. This value gives the
-    # number of additional iterations after iteration 1.
-    n_followup_iterations: int = 30
+    # number of additional iterations after iteration 1. The default value of
+    # 11 gives a maximum of 12 total abundance iterations, limiting the
+    # computational load on shared HPC systems.
+    n_followup_iterations: int = 11
 
     # ASF convergence is evaluated between two consecutive iterations.
     # Standard convergence requires all species to change by <=
@@ -428,6 +439,20 @@ class AutoSpecFitConfig:
     # oscillating element and adopts the average of its final two finite
     # iteration abundances as the final value.
     convergence_tolerance: float = 0.05
+<<<<<<< HEAD
+=======
+
+    # Late-iteration fallback convergence settings. These are used only after
+    # fallback_start_iteration if strict convergence has not been reached.
+    # ASF may accept the solution when at least minimum_converged_fraction of
+    # species satisfy the convergence tolerance and the remaining species show
+    # bounded, non-monotonic late-iteration behavior.
+    minimum_converged_fraction: float = 0.70
+    fallback_start_iteration: int = 10
+    late_history_window: int = 3
+    late_history_peak_to_peak_limit: float = 0.08
+    require_non_monotonic_late_history: bool = True
+>>>>>>> ccc4ee4 (Add late-iteration fallback convergence analysis)
 
     # ------------------------------------------------------------------
     # AutoSpecNorm and model-smoothing settings
@@ -1574,6 +1599,116 @@ def evaluate_convergence_status(
     return False, False, None
 
 
+def is_monotonic_sequence(values: np.ndarray) -> bool:
+    """Return True if a finite sequence is monotonically increasing or decreasing.
+
+    A bounded oscillation can be accepted by the late-iteration fallback, but a
+    steadily increasing or decreasing sequence is treated as a possible drift.
+    """
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) < 3:
+        return False
+
+    differences = np.diff(values)
+    return bool(np.all(differences >= 0.0) or np.all(differences <= 0.0))
+
+
+def late_history_is_stable(
+    history: np.ndarray,
+    config: AutoSpecFitConfig,
+) -> Tuple[bool, float, float]:
+    """Evaluate whether a non-converged species has stable late-iteration behavior.
+
+    The final ``late_history_window`` finite abundances are used. Stability
+    requires a peak-to-peak range smaller than the configured limit. If
+    requested, monotonic late-iteration behavior is rejected because it may
+    indicate continued drift rather than bounded oscillation.
+
+    Returns
+    -------
+    is_stable
+        True if the late history satisfies the fallback stability criteria.
+    adopted_value
+        Median abundance of the final finite values used by the fallback.
+    peak_to_peak
+        Difference between the maximum and minimum late-history values.
+    """
+    history = np.asarray(history, dtype=float)
+    finite_history = history[np.isfinite(history)]
+
+    if len(finite_history) < config.late_history_window:
+        return False, np.nan, np.nan
+
+    late_values = finite_history[-config.late_history_window:]
+    peak_to_peak = float(np.max(late_values) - np.min(late_values))
+    adopted_value = float(np.median(late_values))
+
+    if peak_to_peak > config.late_history_peak_to_peak_limit:
+        return False, adopted_value, peak_to_peak
+
+    if config.require_non_monotonic_late_history and is_monotonic_sequence(late_values):
+        return False, adopted_value, peak_to_peak
+
+    return True, adopted_value, peak_to_peak
+
+
+def evaluate_late_iteration_fallback(
+    change: np.ndarray,
+    mean_history: np.ndarray,
+    iteration_id: int,
+    config: AutoSpecFitConfig,
+) -> Tuple[bool, List[int], Dict[int, Tuple[float, float]]]:
+    """Evaluate late-iteration fallback convergence.
+
+    The fallback is considered only after ``fallback_start_iteration``. It
+    accepts the solution when at least ``minimum_converged_fraction`` of the
+    species satisfy the standard convergence tolerance and all remaining
+    non-converged species have stable late-iteration histories.
+
+    Returns
+    -------
+    fallback_accepted
+        True when the late-iteration fallback criteria are satisfied.
+    non_converged_indices
+        Species indices that did not satisfy the standard convergence
+        tolerance.
+    adopted_values
+        Mapping from non-converged species index to
+        ``(median_late_abundance, late_peak_to_peak_range)``.
+    """
+    if iteration_id < config.fallback_start_iteration:
+        return False, [], {}
+
+    finite = np.isfinite(change)
+    if not np.all(finite):
+        return False, [], {}
+
+    converged_mask = change <= config.convergence_tolerance
+    n_species = len(change)
+    n_converged = int(np.sum(converged_mask))
+    minimum_converged_species = int(np.ceil(config.minimum_converged_fraction * n_species))
+
+    if n_converged < minimum_converged_species:
+        return False, [], {}
+
+    non_converged_indices = np.where(~converged_mask)[0].astype(int).tolist()
+    adopted_values: Dict[int, Tuple[float, float]] = {}
+
+    for species_index in non_converged_indices:
+        stable, adopted_value, peak_to_peak = late_history_is_stable(
+            mean_history[species_index, :iteration_id],
+            config,
+        )
+        if not stable:
+            return False, non_converged_indices, {}
+
+        adopted_values[species_index] = (adopted_value, peak_to_peak)
+
+    return True, non_converged_indices, adopted_values
+
+
 # -----------------------------------------------------------------------------
 # Main pipeline
 # -----------------------------------------------------------------------------
@@ -1729,15 +1864,36 @@ def run_autospecfit_abundance_pipeline(
             mean_history[:, iteration_id - 1] = [result.mean_abundance for result in results]
             rounded_history[:, iteration_id - 1] = [result.rounded_mean_abundance for result in results]
 
-            # Stop when either standard convergence is reached or when only
+            # Stop when either strict convergence is reached or when only
             # one species remains non-converged. In the latter case, ASF
             # treats that species as oscillating and adopts the average of its
             # final two finite iteration abundances as the final value.
+            #
+            # If strict convergence is not reached after fallback_start_iteration,
+            # ASF can also accept a late-iteration fallback solution when at
+            # least a fixed fraction of species have converged and the remaining
+            # species show bounded, non-monotonic late-iteration behavior.
             change = np.abs(mean_history[:, iteration_id - 1] - mean_history[:, iteration_id - 2])
             converged, has_oscillating_species, oscillating_index = evaluate_convergence_status(
                 change,
                 config,
             )
+            fallback_accepted = False
+            fallback_non_converged_indices: List[int] = []
+            fallback_adopted_values: Dict[int, Tuple[float, float]] = {}
+
+            if not converged:
+                (
+                    fallback_accepted,
+                    fallback_non_converged_indices,
+                    fallback_adopted_values,
+                ) = evaluate_late_iteration_fallback(
+                    change=change,
+                    mean_history=mean_history,
+                    iteration_id=iteration_id,
+                    config=config,
+                )
+                converged = fallback_accepted
 
             if converged:
                 final_not_rounded = mean_history[:, iteration_id - 1].copy()
@@ -1777,6 +1933,48 @@ def run_autospecfit_abundance_pipeline(
                             f"{oscillating_element} abundance was set to "
                             f"{averaged_value:+.3f}."
                         )
+                    else:
+                        note = (
+                            f"Iteration {iteration_id}: {oscillating_element} "
+                            f"remained non-converged, but no finite iteration "
+                            f"history was available for replacement."
+                        )
+
+                    LOGGER.warning(note)
+                    log_handle.write(f"# {note}\n")
+                    log_handle.flush()
+                    nan_replacement_notes.append(note)
+
+                if fallback_accepted:
+                    n_species = species.n_species
+                    minimum_converged_species = int(
+                        np.ceil(config.minimum_converged_fraction * n_species)
+                    )
+                    note = (
+                        f"Iteration {iteration_id}: late-iteration fallback "
+                        f"accepted. At least {minimum_converged_species}/{n_species} "
+                        f"species satisfied the convergence tolerance "
+                        f"({config.convergence_tolerance:.3f} dex)."
+                    )
+                    LOGGER.warning(note)
+                    log_handle.write(f"# {note}\n")
+                    log_handle.flush()
+                    nan_replacement_notes.append(note)
+
+                    for species_index in fallback_non_converged_indices:
+                        element_name = species.element_names[species_index]
+                        adopted_value, peak_to_peak = fallback_adopted_values[species_index]
+                        final_not_rounded[species_index] = adopted_value
+                        final_rounded[species_index] = np.round(adopted_value, 2)
+
+                        note = (
+                            f"Iteration {iteration_id}: {element_name} did not "
+                            f"satisfy the strict convergence tolerance. The final "
+                            f"{element_name} abundance was set to the median of "
+                            f"the final {config.late_history_window} finite "
+                            f"iterations ({adopted_value:+.3f}); late-history "
+                            f"peak-to-peak range = {peak_to_peak:.3f} dex."
+                        )
                         LOGGER.warning(note)
                         log_handle.write(f"# {note}\n")
                         log_handle.flush()
@@ -1799,9 +1997,13 @@ def run_autospecfit_abundance_pipeline(
                 )
                 return
 
-        # If the loop finishes without satisfying convergence, save the last
-        # iteration as the best available result and make this explicit.
-        LOGGER.warning("Maximum number of iterations reached before formal convergence.")
+        # If the loop finishes without satisfying either strict convergence or
+        # late-iteration fallback convergence, save the last iteration as the
+        # best available result and make this explicit.
+        LOGGER.warning(
+            "Maximum number of iterations reached before strict or fallback "
+            "convergence was accepted."
+        )
         final_errors = species_abundance_errors_from_iteration(results)
         write_final_abundance_table(
             final_not_rounded=mean_history[:, -1],
