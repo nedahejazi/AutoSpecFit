@@ -139,7 +139,7 @@ ASF abundances are reported as abundance offsets that must be combined with the
 abundance pattern adopted in the input model atmosphere to obtain abundances on
 the standard [X/H] scale.
 
-For non-alpha elements:
+For non-alpha elements, the final abundance is computed as:
 
 [X/H] = [M/H]input + ASF(X)
 
