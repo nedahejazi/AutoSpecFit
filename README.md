@@ -81,7 +81,7 @@ Future ASF versions will include iterative stellar-parameter optimization.
 
 ## Abundance Scale and Conversion to [X/H]
 
-Abundances reported by ASF correspond to abundance offsets relative to the chemical composition of the adopted model atmosphere. They are therefore not direct `[X/H]` abundances.
+Abundances reported by ASF correspond to abundance offsets relative to the abundance patern of the adopted model atmosphere. They are therefore not direct `[X/H]` abundances.
 
 For non-alpha elements, the final abundance is computed as:
 
@@ -107,8 +107,12 @@ ASF(Mg)         = +0.15
 [Mg/H] = -0.30 + 0.12 + 0.15 = -0.03
 ```
 
-This abundance formulation follows Equation 4 of Hejazi et al. (2025, AJ, 170, 18; DOI: 10.3847/1538-3881/add696).
+The abundance notation and formulation adopted by ASF follow:
 
+Hejazi, N., Lépine, S., Nordlander, T., Jao, W.-C., Coria, D. R., &
+Lester, K. V. 2025, AJ, 170, 18
+
+DOI: 10.3847/1538-3881/add696
 
 ---
 
