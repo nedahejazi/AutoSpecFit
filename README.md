@@ -121,7 +121,7 @@ DOI: 10.3847/1538-3881/add696
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/AutoSpecFit.git
+git clone https://github.com/nedahejazi/AutoSpecFit.git
 cd AutoSpecFit
 ```
 
@@ -130,9 +130,6 @@ Install required Python packages:
 ```bash
 pip install -r requirements.txt
 ```
-
-Replace `YOUR_USERNAME` with your GitHub username after creating the repository.
-
 ---
 
 ## Repository Structure
