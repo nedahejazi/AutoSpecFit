@@ -135,40 +135,30 @@ Additional ASF applications are currently in preparation.
 
 Abundance Scale and Conversion to [X/H]
 ------------------------------------
+ASF abundances are reported as abundance offsets that must be combined with the
+abundance pattern adopted in the input model atmosphere to obtain abundances on
+the standard [X/H] scale.
 
-Abundances reported by ASF correspond to the relative abundance offsets
-ABUND(X) used by Turbospectrum and are therefore not direct [X/H]
-abundances. During the ASF fitting procedure, the abundance of each
-element is varied relative to the metallicity of the input model
-atmosphere while the abundances of the remaining elements are fixed to
-their adopted values.
+For non-alpha elements:
 
-To obtain the final abundance of an element on the standard abundance
-scale, the ASF abundance should be combined with the input metallicity
-used to generate the synthetic spectra:
+[X/H] = [M/H]input + ASF(X)
 
-    [X/H] = [M/H]input + ASF(X)
+For alpha elements (e.g., O, Mg, Si, Ca, and Ti), the alpha enhancement adopted
+in the model atmosphere must also be included:
 
-where ASF(X) is the abundance offset determined by ASF for element X,
-and [M/H]input is the metallicity supplied by the user and adopted for
-the model atmosphere (equivalent to the MARCS and Turbospectrum
-parameter z).
+[X/H] = [M/H]input + [alpha/Fe]input + ASF(X)
 
-For example, if the input model metallicity is:
+where ASF(X) is the abundance offset measured by ASF for element X, [M/H]input is
+the input metallicity supplied by the user, and [alpha/Fe]input is the input
+alpha-element enhancement also supplied by the user.
 
-    [M/H]input = -0.30
+For example, for magnesium (Mg), which is an alpha element:
 
-and ASF returns:
+[M/H]input      = -0.30
+[alpha/Fe]input = +0.12
+ASF(Mg)         = +0.15
 
-    ASF(Mg) = +0.15
-
-then:
-
-    [Mg/H] = -0.30 + 0.15 = -0.15
-
-Because ASF abundances are measured relative to the adopted model
-metallicity, users should always retain a record of the input [M/H]
-value used for the analysis when reporting final elemental abundances.
+[Mg/H] = -0.30 + 0.12 + 0.15 = -0.03
 
 The abundance notation and formulation adopted by ASF follow:
 
@@ -177,8 +167,6 @@ Lester, K. V. 2025, AJ, 170, 18
 
 DOI: 10.3847/1538-3881/add696
 
-See Hejazi et al. (2025) for the formal relationship between
-ABUND(X), [M/H], [X/H], absolute abundances A(X), and abundance ratios.
 """
 
 from dataclasses import dataclass, field
