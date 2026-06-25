@@ -432,7 +432,7 @@ class AutoSpecFitConfig:
     # all other species satisfy this threshold, ASF treats that species as an
     # oscillating element and adopts the average of its final two finite
     # iteration abundances as the final value.
-    convergence_tolerance: float = 0.05
+    convergence_tolerance: float = 0.04
 
 
 
