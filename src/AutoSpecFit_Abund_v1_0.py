@@ -247,13 +247,13 @@ class SpeciesConfig:
 
 
     element_codes: Tuple[str, ...] = (
-        "x08", "x12", "x13", "x14", "x19", "x20", "x22", "x24", "x25", "x26"
+        "x08", "x12", "x13", "x19", "x20", "x22", "x24", "x25", "x26"
     )
     element_names: Tuple[str, ...] = (
-        "O", "Mg", "Al", "Si", "K", "Ca", "Ti", "Cr", "Mn", "Fe"
+        "O", "Mg", "Al", "K", "Ca", "Ti", "Cr", "Mn", "Fe"
     )
     species_names: Tuple[str, ...] = (
-        "OH", "Mg", "Al", "Si", "K", "Ca", "Ti", "Cr", "Mn", "Fe"
+        "OH", "Mg", "Al", "K", "Ca", "Ti", "Cr", "Mn", "Fe"
     )
 
     def __post_init__(self) -> None:
