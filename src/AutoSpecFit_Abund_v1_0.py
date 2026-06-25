@@ -427,7 +427,7 @@ class AutoSpecFitConfig:
     n_followup_iterations: int = 11
 
     # ASF convergence is evaluated between two consecutive iterations.
-    # Standard convergence requires all species to change by 
+    # Standard convergence requires all species to change by <=
     # convergence_tolerance. If exactly one species remains non-converged while
     # all other species satisfy this threshold, ASF treats that species as an
     # oscillating element and adopts the average of its final two finite
