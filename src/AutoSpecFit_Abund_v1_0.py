@@ -439,8 +439,8 @@ class AutoSpecFitConfig:
     # oscillating element and adopts the average of its final two finite
     # iteration abundances as the final value.
     convergence_tolerance: float = 0.05
-<<<<<<< HEAD
-=======
+
+
 
     # Late-iteration fallback convergence settings. These are used only after
     # fallback_start_iteration if strict convergence has not been reached.
@@ -452,7 +452,7 @@ class AutoSpecFitConfig:
     late_history_window: int = 3
     late_history_peak_to_peak_limit: float = 0.08
     require_non_monotonic_late_history: bool = True
->>>>>>> ccc4ee4 (Add late-iteration fallback convergence analysis)
+
 
     # ------------------------------------------------------------------
     # AutoSpecNorm and model-smoothing settings
