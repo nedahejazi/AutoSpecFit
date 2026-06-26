@@ -444,7 +444,7 @@ class AutoSpecFitConfig:
     late_history_window: int = 3
     late_history_peak_to_peak_limit: float = 0.08
     require_non_monotonic_late_history: bool = True
-=======
+
     # Tiered convergence settings used by ASF.
     #
     # Iterations 2-6:
