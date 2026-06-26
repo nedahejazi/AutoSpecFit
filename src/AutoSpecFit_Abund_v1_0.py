@@ -149,14 +149,8 @@ in the model atmosphere must also be included:
 [X/H] = [M/H]input + [alpha/Fe]input + ASF(X)
 
 where ASF(X) is the abundance offset measured by ASF for element X, [M/H]input is
-<<<<<<< HEAD
 the input metallicity supplied by the user, and [alpha/Fe]input is the input alpha-element
 enhancement also provided by the user.
-=======
-=======
->>>>>>> 2367185 (Revise tiered convergence criteria)
-the input metallicity supplied by the user, and [alpha/Fe]input is the input
-alpha-element enhancement also provided by the user.
 
 For example, for magnesium (Mg), which is an alpha element:
 
