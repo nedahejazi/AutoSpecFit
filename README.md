@@ -16,14 +16,14 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 
 ## Main Features
 
-- Automated line-by-line abundance determination.
+- Automated line-by-line elemental abundance determination.
 - Local pseudo-continuum normalization of the observed spectrum using AutoSpecNorm (ASN).
-- Local normalization of the observed spectrum performed independently with respect to each tested synthetic spectrum.
-- Abundance-dependent pseudo-continuum placement.
-- Iterative abundance refinement.
+- Independent local normalization of the observed spectrum with respect to each synthetic spectrum evaluated during the fitting process.
+- Abundance-dependent pseudo-continuum placement for self-consistent abundance measurements..
+- Iterative refinement of elemental abundances.
 - Line-by-line chi-square analysis.
 - Designed for high-resolution spectra of cool stars.
-- Tested primarily on IGRINS spectra with resolving power R ≈ 45,000.
+- Primarily tested on IGRINS spectra with resolving power R ≈ 45,000.
 - Compatible with Turbospectrum v15.1 through user-supplied external synthesis scripts.
 
 ---
