@@ -134,11 +134,7 @@ Additional ASF applications are currently in preparation.
 
 
 Abundance Scale and Conversion to [X/H]
-<<<<<<< HEAD
-------------------------------------
-=======
 --------------------------------------
->>>>>>> 2367185 (Revise tiered convergence criteria)
 ASF abundances are reported as abundance offsets that must be combined with the
 abundance pattern adopted in the input model atmosphere to obtain abundances on
 the standard [X/H] scale.
