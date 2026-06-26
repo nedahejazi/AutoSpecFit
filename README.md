@@ -30,7 +30,7 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 
 ## AutoSpecNorm (ASN)
 
-ASF uses AutoSpecNorm (ASN) for the local pseudo-continuum normalization of the observed spectrum. Unlike approaches that compare a single normalized observed spectrum with all synthetic spectra, ASF normalizes the observed spectrum independently relative to every synthetic spectrum tested during the chi-square fitting procedure. This allows the pseudo-continuum placement to adapt to abundance-dependent changes in the synthetic spectrum and keeps the abundance determination self-consistent.
+AutoSpecNorm (ASN) is the local pseudo-continuum normalization module integrated into ASF. Unlike conventional approaches that compare a single normalized observed spectrum with all synthetic spectra, ASN performs an independent local normalization of the observed spectrum for every synthetic spectrum evaluated during the chi-square fitting procedure. This allows the pseudo-continuum placement to adapt to abundance-dependent spectral variations, ensuring a self-consistent abundance analysis.
 
 ASN consists of two main modules:
 
