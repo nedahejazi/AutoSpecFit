@@ -2,7 +2,7 @@
 
 **Automated Spectral Fitting Framework for Chemical Abundance Measurements of Cool Stars**
 
-AutoSpecFit (ASF) is an automated line-by-line spectral synthesis framework designed for high-resolution chemical abundance measurements of cool stars. ASF measures elemental abundances through chi-square fitting of individual spectral lines by comparing synthetic spectra generated with Turbospectrum to observed spectra that are locally pseudo-continuum normalized relative to each synthetic spectrum separately using AutoSpecNorm (ASN).
+AutoSpecFit (ASF) is an automated line-by-line spectral synthesis framework designed for high-resolution chemical abundance measurements of cool stars. ASF derives elemental abundances through line-by-line chi-square minimization by comparing synthetic spectra generated with Turbospectrum to observed spectra. Prior to each comparison, the observed spectrum is locally pseudo-continuum normalized relative to each synthetic spectrum independently using the AutoSpecNorm (ASN) framework.
 
 ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospheric parameters supplied by the user. A future release, ASF v2.0, will introduce iterative stellar-parameter optimization between abundance iterations, enabling self-consistent determinations of effective temperature (Teff), surface gravity (log g), and overall metallicity ([M/H]) alongside elemental abundances. This extension will allow atmospheric parameters and chemical abundances to be refined simultaneously throughout the fitting process. 
 
