@@ -470,7 +470,6 @@ class AutoSpecFitConfig:
     intermediate_convergence_start_iteration: int = 7
     late_convergence_start_iteration: int = 9
     final_statistics_window: int = 3
->>>>>>> 2367185 (Revise tiered convergence criteria)
 
 
     # ------------------------------------------------------------------
