@@ -149,8 +149,8 @@ in the model atmosphere must also be included:
 [X/H] = [M/H]input + [alpha/Fe]input + ASF(X)
 
 where ASF(X) is the abundance offset measured by ASF for element X, [M/H]input is
-the input metallicity supplied by the user, and [alpha/Fe]input is the input alpha-element
-enhancement also provided by the user.
+the input metallicity supplied by the user, and [alpha/Fe]input is the input
+alpha-element enhancement also provided by the user.
 
 For example, for magnesium (Mg), which is an alpha element:
 
@@ -422,28 +422,6 @@ class AutoSpecFitConfig:
     # 11 gives a maximum of 12 total abundance iterations, limiting the
     # computational load on shared HPC systems.
     n_followup_iterations: int = 11
-
-    
-    # ASF convergence is evaluated between two consecutive iterations.
-    # Standard convergence requires all species to change by <=
-    # convergence_tolerance. If exactly one species remains non-converged while
-    # all other species satisfy this threshold, ASF treats that species as an
-    # oscillating element and adopts the average of its final two finite
-    # iteration abundances as the final value.
-    convergence_tolerance: float = 0.04
-
-
-
-    # Late-iteration fallback convergence settings. These are used only after
-    # fallback_start_iteration if strict convergence has not been reached.
-    # ASF may accept the solution when at least minimum_converged_fraction of
-    # species satisfy the convergence tolerance and the remaining species show
-    # bounded, non-monotonic late-iteration behavior.
-    minimum_converged_fraction: float = 0.70
-    fallback_start_iteration: int = 10
-    late_history_window: int = 3
-    late_history_peak_to_peak_limit: float = 0.08
-    require_non_monotonic_late_history: bool = True
 
     # Tiered convergence settings used by ASF.
     #
