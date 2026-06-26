@@ -21,7 +21,7 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 - Independent local normalization of the observed spectrum with respect to each synthetic spectrum evaluated during the fitting process.
 - Abundance-dependent pseudo-continuum placement for self-consistent abundance measurements..
 - Iterative refinement of elemental abundances.
-- Line-by-line chi-square minimzation.
+- Compute line-by-line chi-square curves..
 - Designed for high-resolution spectra of cool stars.
 - Primarily tested on IGRINS spectra with resolving power R ≈ 45,000.
 - Compatible with Turbospectrum v15.1 through user-supplied external synthesis scripts.
