@@ -17,12 +17,11 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 ## Main Features
 
 - Automated line-by-line abundance determination.
-- Local pseudo-continuum normalization using AutoSpecNorm (ASN).
-- Local normalization performed independently for each tested synthetic spectrum.
+- Local pseudo-continuum normalization of the observed spectrum using AutoSpecNorm (ASN).
+- Local normalization of the observed spectrum performed independently with respect to each tested synthetic spectrum.
 - Abundance-dependent pseudo-continuum placement.
 - Iterative abundance refinement.
 - Line-by-line chi-square analysis.
-- Abundance uncertainty estimation.
 - Designed for high-resolution spectra of cool stars.
 - Tested primarily on IGRINS spectra with resolving power R ≈ 45,000.
 - Compatible with Turbospectrum v15.1 through user-supplied external synthesis scripts.
@@ -31,7 +30,7 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 
 ## AutoSpecNorm (ASN)
 
-ASF uses AutoSpecNorm (ASN) for local pseudo-continuum normalization. Unlike approaches that apply a single normalization to all synthetic spectra, ASF applies local normalization independently to every synthetic spectrum tested during the chi-square fitting procedure. This allows the pseudo-continuum placement to adapt to abundance-dependent changes in the synthetic spectrum and keeps the abundance determination self-consistent.
+ASF uses AutoSpecNorm (ASN) for the local pseudo-continuum normalization of the observed spectrum. Unlike approaches that compare a single normalized observed spectrum with all synthetic spectra, ASF normalizes the observed spectrum independently relative to every synthetic spectrum tested during the chi-square fitting procedure. This allows the pseudo-continuum placement to adapt to abundance-dependent changes in the synthetic spectrum and keeps the abundance determination self-consistent.
 
 ASN consists of two main modules:
 
