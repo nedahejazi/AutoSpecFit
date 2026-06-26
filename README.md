@@ -47,7 +47,7 @@ ASN consists of two main modules:
 4. Launch Turbospectrum calculations externally.
 5. Wait for synthetic spectra to become available.
 6. Perform local pseudo-continuum normalization with ASN.
-7. Compute line-by-line chi-square curves.
+7. Line-by-line chi-square minimization.
 8. Determine best-fit abundances and uncertainties.
 9. Update fixed elemental abundances between iterations.
 10. Write final abundance results.
