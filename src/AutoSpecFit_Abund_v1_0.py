@@ -423,7 +423,7 @@ class AutoSpecFitConfig:
     # computational load on shared HPC systems.
     n_followup_iterations: int = 11
 
-<<<<<<< HEAD
+    
     # ASF convergence is evaluated between two consecutive iterations.
     # Standard convergence requires all species to change by <=
     # convergence_tolerance. If exactly one species remains non-converged while
