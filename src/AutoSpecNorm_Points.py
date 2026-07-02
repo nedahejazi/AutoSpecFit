@@ -17,6 +17,45 @@ thresholds to achieve optimal performance.
 import numpy as np
 
 
+def _nearest_wavelength_index(wavelength_grid, target_wavelength, atol=1.0e-8):
+    """Return one robust index for a target wavelength.
+
+    The wavelength candidates used by AutoSpecNorm are selected from the
+    observed wavelength grid. In rare cases, rounding or repeated wavelength
+    values can make one candidate match more than one grid index. This helper
+    always returns a single representative index, preventing array-shape
+    broadcast errors while preserving the selected normalization wavelength.
+    """
+    wavelength_grid = np.asarray(wavelength_grid, dtype=float)
+
+    if wavelength_grid.size == 0:
+        return None
+
+    close_indices = np.where(
+        np.isclose(wavelength_grid, target_wavelength, rtol=0.0, atol=atol)
+    )[0]
+
+    if close_indices.size > 0:
+        closest_local_index = np.argmin(
+            np.abs(wavelength_grid[close_indices] - target_wavelength)
+        )
+        return int(close_indices[closest_local_index])
+
+    return int(np.argmin(np.abs(wavelength_grid - target_wavelength)))
+
+
+def _unique_indices_preserve_order(indices):
+    """Return unique integer indices while preserving their original order."""
+    unique_indices = []
+    seen = set()
+
+    for index in indices:
+        index = int(index)
+        if index not in seen:
+            unique_indices.append(index)
+            seen.add(index)
+
+    return unique_indices
 def AutoSpecNorm_Points(
     RV,
     lam_analysis,
@@ -204,11 +243,13 @@ def AutoSpecNorm_Points(
     # for further evaluation using the observed spectrum in the next step.
     
     n_good_points = 0
-    good_indices = np.zeros((len(lam_cut_work), 1), dtype=int)
+    good_indices = []
 
     for point_index in range(len(lam_cut_work)):
 
-        indices = np.where(np.isin(lam_star_cut, lam_cut_work[point_index]))[0]
+        indices = _nearest_wavelength_index(lam_star_cut, lam_cut_work[point_index])
+        if indices is None:
+            continue
 
         index_neighbor_1 = ((lam_star_cut >= lam_cut_work[point_index] - 0.2) & (lam_star_cut < lam_cut_work[point_index])) | \
                            ((lam_star_cut > lam_cut_work[point_index]) & (lam_star_cut <= lam_cut_work[point_index] + 0.2))
@@ -426,9 +467,9 @@ def AutoSpecNorm_Points(
                                 if (len(flux_interp_model_cut_neighbor_6) > 0 and
                                         np.all(flux_interp_model_cut_work[point_index] >= flux_interp_model_cut_neighbor_6 - 20 * peak_index_model)):
                                     n_good_points = n_good_points + 1
-                                    good_indices[n_good_points - 1]  = indices
+                                    good_indices.append(indices)
 
-    good_indices = good_indices[good_indices != 0]
+    good_indices = np.asarray(_unique_indices_preserve_order(good_indices), dtype=int)
     lam_cut_work = lam_star_cut[good_indices]
     flux_star_cut_work = flux_star_cut[good_indices]
     flux_interp_model_cut_work = flux_interp_model_cut[good_indices]
@@ -461,14 +502,13 @@ def AutoSpecNorm_Points(
     # The points that satisfy these observed-spectrum criteria are adopted as
     # the final normalization points used by AutoSpecNorm.
     n_good_points = 0
-    good_indices = np.zeros(len(lam_cut_work), dtype=int)
+    good_indices = []
 
     for point_index in range(len(lam_cut_work)):
 
-        indices = np.where(np.isin(lam_star_cut, lam_cut_work[point_index]))[0]
-
-        if len(indices) > 0:
-            indices = indices[0]
+        indices = _nearest_wavelength_index(lam_star_cut, lam_cut_work[point_index])
+        if indices is None:
+            continue
         index_neighbor_1 = ((lam_star_cut >= lam_cut_work[point_index] - 0.2) & (lam_star_cut < lam_cut_work[point_index])) | \
                            ((lam_star_cut > lam_cut_work[point_index]) & (lam_star_cut <= lam_cut_work[point_index] + 0.2))
 
@@ -647,9 +687,9 @@ def AutoSpecNorm_Points(
 
                                     if np.all(flux_star_cut_work[point_index] >= flux_star_cut_neighbor_7 - 30 * peak_index_star):
                                         n_good_points = n_good_points + 1
-                                        good_indices[n_good_points - 1] = indices
+                                        good_indices.append(indices)
 
-    good_indices = good_indices[good_indices != 0]
+    good_indices = np.asarray(_unique_indices_preserve_order(good_indices), dtype=int)
     lam_cut_work = lam_star_cut[good_indices]
     flux_star_cut_work = flux_star_cut[good_indices]
     flux_interp_model_cut_work = flux_interp_model_cut[good_indices]
@@ -664,3 +704,4 @@ def AutoSpecNorm_Points(
         flux_star_cut_work,
         flux_interp_model_cut_work,
     )
+

@@ -1195,14 +1195,6 @@ def compute_line_chi2_curve(
 
     for abundance_index, model_path in enumerate(model_paths):
         abundance_value = float(abundances[abundance_index])
-        LOGGER.info(
-            "ASN start | line %.3f | abundance %+.3f | grid %d/%d",
-            line_center,
-            abundance_value,
-            abundance_index + 1,
-            len(abundances),
-        )
-
         try:
             lam_model, flux_model = read_model_spectrum(model_path, config.gaussian_sigma_pixels)
         except FileNotFoundError:
@@ -1243,14 +1235,6 @@ def compute_line_chi2_curve(
             config.autospecnorm_iteration_number,
         )
 
-        LOGGER.info(
-            "ASN done  | line %.3f | abundance %+.3f | flag=%s | n_norm_points=%d",
-            line_center,
-            abundance_value,
-            flag,
-            len(lam_cut_work),
-        )
-
         # Reject cases where AutoSpecNorm could not identify usable continuum
         # points on both sides of the fitted line.
         has_left_point = np.any(lam_cut_work < line_center)
@@ -1277,13 +1261,6 @@ def compute_line_chi2_curve(
         chi2_value = np.sum(((obs[valid_variance] - model[valid_variance]) ** 2) / variance[valid_variance])
         chi2_curve[abundance_index] = chi2_value
         valid_abundances.append(abundances[abundance_index])
-
-        LOGGER.info(
-            "Chi2 done | line %.3f | abundance %+.3f | chi2=%.6e",
-            line_center,
-            abundance_value,
-            chi2_value,
-        )
 
     return chi2_curve, np.asarray(valid_abundances, dtype=float)
 
