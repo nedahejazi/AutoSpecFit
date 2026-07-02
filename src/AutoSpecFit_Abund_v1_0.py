@@ -581,6 +581,29 @@ def read_observed_spectrum(path: Path, wavelength_scale: float) -> Tuple[np.ndar
     lam_star = data[:, 0] * wavelength_scale
     flux_star = data[:, 1]
     err_flux_star = data[:, 2]
+
+    # Sort the observed spectrum by wavelength.
+    sort_index = np.argsort(lam_star)
+    lam_star = lam_star[sort_index]
+    flux_star = flux_star[sort_index]
+    err_flux_star = err_flux_star[sort_index]
+
+    # Remove duplicate wavelength points while keeping the first occurrence.
+    # Duplicate wavelengths can otherwise cause one normalization wavelength
+    # to correspond to multiple array indices inside AutoSpecNorm.
+    n_before = len(lam_star)
+    lam_star, unique_index = np.unique(lam_star, return_index=True)
+    flux_star = flux_star[unique_index]
+    err_flux_star = err_flux_star[unique_index]
+    n_removed = n_before - len(lam_star)
+
+    if n_removed > 0:
+        LOGGER.info(
+            "Removed %d duplicate wavelength points from observed spectrum: %s",
+            n_removed,
+            path,
+        )
+
     return lam_star, flux_star, err_flux_star
 
 
@@ -636,6 +659,26 @@ def read_model_spectrum(path: Path, gaussian_sigma_pixels: float) -> Tuple[np.nd
 
     lam_model = data[:, 0]
     flux_model = gaussian_filter1d(data[:, 1], sigma=gaussian_sigma_pixels, mode="nearest")
+
+    # Sort the synthetic spectrum by wavelength.
+    sort_index = np.argsort(lam_model)
+    lam_model = lam_model[sort_index]
+    flux_model = flux_model[sort_index]
+
+    # Remove duplicate wavelength points while keeping the first occurrence.
+    # This keeps interpolation and AutoSpecNorm wavelength matching stable.
+    n_before = len(lam_model)
+    lam_model, unique_index = np.unique(lam_model, return_index=True)
+    flux_model = flux_model[unique_index]
+    n_removed = n_before - len(lam_model)
+
+    if n_removed > 0:
+        LOGGER.info(
+            "Removed %d duplicate wavelength points from synthetic spectrum: %s",
+            n_removed,
+            path,
+        )
+
     return lam_model, flux_model
 
 
