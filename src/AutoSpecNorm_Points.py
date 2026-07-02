@@ -44,6 +44,24 @@ def _nearest_wavelength_index(wavelength_grid, target_wavelength, atol=1.0e-8):
     return int(np.argmin(np.abs(wavelength_grid - target_wavelength)))
 
 
+def _fast_wavelength_index(wavelength_grid, target_wavelength):
+    """Return one index for a selected wavelength using a fast exact match first.
+
+    In normal ASF/ASN usage, ``target_wavelength`` comes directly from
+    ``wavelength_grid`` after boolean filtering, so an exact match is almost
+    always available.  The exact-match path is much faster than scanning with
+    ``np.isclose`` for every candidate point.  If the exact match fails because
+    of rounding or repeated wavelength values, the robust nearest-index helper
+    is used as a safe fallback.
+    """
+    matched_indices = np.where(wavelength_grid == target_wavelength)[0]
+
+    if matched_indices.size > 0:
+        return int(matched_indices[0])
+
+    return _nearest_wavelength_index(wavelength_grid, target_wavelength)
+
+
 def _unique_indices_preserve_order(indices):
     """Return unique integer indices while preserving their original order."""
     unique_indices = []
@@ -247,7 +265,7 @@ def AutoSpecNorm_Points(
 
     for point_index in range(len(lam_cut_work)):
 
-        indices = _nearest_wavelength_index(lam_star_cut, lam_cut_work[point_index])
+        indices = _fast_wavelength_index(lam_star_cut, lam_cut_work[point_index])
         if indices is None:
             continue
 
@@ -506,7 +524,7 @@ def AutoSpecNorm_Points(
 
     for point_index in range(len(lam_cut_work)):
 
-        indices = _nearest_wavelength_index(lam_star_cut, lam_cut_work[point_index])
+        indices = _fast_wavelength_index(lam_star_cut, lam_cut_work[point_index])
         if indices is None:
             continue
         index_neighbor_1 = ((lam_star_cut >= lam_cut_work[point_index] - 0.2) & (lam_star_cut < lam_cut_work[point_index])) | \
