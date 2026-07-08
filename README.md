@@ -24,7 +24,7 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 - Iterative refinement of elemental abundances.
 - Designed for high-resolution spectra of cool stars.
 - Primarily tested on IGRINS spectra with resolving power R ≈ 45,000.
-- Compatible with Turbospectrum v15.1 through user-supplied external synthesis scripts.
+- Compatible with Turbospectrum v15.1 through user-supplied external scripts.
 
 ---
 
