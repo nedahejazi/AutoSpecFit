@@ -18,7 +18,7 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 
 - Automated line-by-line elemental abundance determination.
 - Local pseudo-continuum normalization of the observed spectrum using AutoSpecNorm (ASN).
-- Independent local normalization of the observed spectrum with respect to each synthetic spectrum examined during the fitting process.
+- Local normalization of the observed spectrum with respect to each synthetic spectrum examined during the fitting process.
 - Abundance-dependent pseudo-continuum placement for self-consistent abundance measurements.
 - Line-by-line chi-square minimization.
 - Iterative refinement of elemental abundances.
