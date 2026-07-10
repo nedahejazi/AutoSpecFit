@@ -49,7 +49,7 @@ ASN consists of two main modules:
 7. Compute line-by-line chi-square curves.
 8. Determine best-fit abundances and uncertainties.
 9. Update elemental abundances between iterations.
-10. Write final abundance results.
+10. Write final abundances and uncertainties.
 
 ---
 
