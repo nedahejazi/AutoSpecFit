@@ -31,9 +31,10 @@ The current ASF workflow proceeds as follows:
 
 Current Release
 ---------------
-This GJ 205 configuration extends the abundance workflow with iterative stellar-
-parameter refinement between abundance iterations. The atmospheric parameters are
-updated sequentially and then rechecked in a second, narrower all-lines pass.
+ASF v2.0 extends the abundance workflow with iterative stellar-parameter refinement
+between abundance iterations. The parameters are updated sequentially and then
+rechecked in a second, narrower pass. The supplied GJ 205 settings provide an
+example configuration that users should adapt to their target and diagnostic lines.
 
 Required stellar atmospheric parameters include:
 
@@ -41,7 +42,7 @@ Required stellar atmospheric parameters include:
     - Surface gravity (log g)
     - Overall metallicity ([M/H])
 
-Additional fitted synthesis parameters in this GJ 205 configuration are:
+Additional fitted synthesis parameters in ASF v2.0 are:
 
     - Alpha enhancement ([alpha/Fe])
     - Microturbulent velocity (vmic)
@@ -475,27 +476,35 @@ class AutoSpecFitConfig:
     final_statistics_window: int = 3
 
     # ------------------------------------------------------------------
-    # Sequential stellar-parameter refinement (GJ 205 configuration)
+    # Sequential stellar-parameter refinement
     # ------------------------------------------------------------------
 
     # Run one-dimensional atmospheric-parameter refinement after each
-    # completed abundance iteration. The GJ 205 sequence is:
+    # completed abundance iteration. Only one parameter varies in each sub-step.
     #
-    # vmic(all lines) -> [M/H] -> log g -> Teff ->
-    # [alpha/Fe](alpha-element lines only)
+    # The general ASF v2.0 ordering strategy is:
+    #   1. Fit vmic first using all selected parameter lines.
+    #   2. Fit [M/H], log g, and Teff in a target-dependent order. Parameters
+    #      with stronger and more distinct diagnostic lines should be fitted
+    #      earlier. If no suitable diagnostic subset is available for one of
+    #      these parameters, place it last among the three and fit it using all
+    #      selected parameter lines.
+    #   3. Fit [alpha/Fe] last using the selected alpha-element lines.
     #
-    # Only one atmospheric parameter varies in each sub-step.
+    # The example configuration below uses the order encoded by the calls in the
+    # target-specific refiner and can be adapted for other targets.
     refine_parameters_after_each_iteration: bool = True
 
     # File containing all parameter-diagnostic lines. Expected columns:
     # Line_num Species line_center RV min_fit max_fit
     parameter_line_file: Path = Path("All_Species_Fit_Ranges_GJ205.txt")
 
-    # GJ 205 Pass-1 diagnostic line numbers (1-based, matching
-    # parameter_line_file).  [M/H] and log g use the selected diagnostic
-    # subsets below.  No separate Teff diagnostic subset is adopted for GJ 205
-    # in this configuration, so the Pass-1 Teff fit intentionally uses all 98
-    # parameter lines.
+    # Example Pass-1 diagnostic-line selections (1-based, matching
+    # parameter_line_file). For general use, define parameter-specific subsets
+    # according to the strength and distinctiveness of the diagnostic lines for
+    # the target. If a suitable subset cannot be identified for a parameter, use
+    # the full selected parameter-line list and place that parameter last among
+    # [M/H], log g, and Teff. The values below are the supplied example settings.
     metallicity_diagnostic_lines: Tuple[int, ...] = (12, 13, 65, 66, 68)
     logg_diagnostic_lines: Tuple[int, ...] = (4, 48, 55, 65, 66, 68, 98)
     teff_diagnostic_lines: Tuple[int, ...] = tuple(range(1, 99))
@@ -539,7 +548,7 @@ class AutoSpecFitConfig:
     second_pass_alpha_half_width: float = 0.10
 
     # Cumulative history tables. The legacy row-style parameter history is kept
-    # for restart compatibility with older GJ 205 runs.
+    # for restart compatibility with older runs produced by this example setup.
     abundance_history_file: str = "ASF_Abundance_History_GJ205.txt"
     parameter_history_file: str = "ASF_Parameter_History_GJ205.txt"
     legacy_parameter_history_file: str = "ASF_Stellar_Parameter_History_GJ205.txt"
@@ -1438,7 +1447,7 @@ def wait_for_model_files(model_paths: Iterable[Iterable[Path]], config: AutoSpec
 def is_noninterpolated_atmosphere(stellar_parameters: StellarParameters) -> bool:
     """
     Return True only for MARCS atmosphere combinations available directly
-    (without interpolation) under the user's GJ 205 grid rule.
+    without interpolation under the atmosphere-grid rule adopted by the user.
     """
     try:
         teff = float(stellar_parameters.teff)
@@ -2696,7 +2705,7 @@ def rebuild_history_outputs_from_restart(
     last_parameter_errors: Dict[str, float],
     last_parameter_consistency_shifts: Dict[str, float],
 ) -> None:
-    """Create new cumulative history files when resuming an older GJ205 run.
+    """Create new cumulative history files when resuming an older run.
 
     Abundance values are reconstructed directly from the checkpoint arrays. Older
     random errors are unavailable in legacy checkpoints and are therefore left NaN.
@@ -2814,7 +2823,7 @@ class ParameterDiagnosticLines:
 
 
 def read_parameter_diagnostic_lines(path: Path) -> ParameterDiagnosticLines:
-    """Read the six-column GJ 205 atmospheric-parameter diagnostic-line file."""
+    """Read the six-column atmospheric-parameter diagnostic-line file."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Parameter diagnostic-line file not found: {path}")
@@ -4023,18 +4032,21 @@ def gj205_parameter_refiner(
     err_flux_star: np.ndarray,
     config: AutoSpecFitConfig,
 ) -> ParameterRefinementResult:
-    """Run the two-pass GJ 205 atmospheric-parameter refinement.
+    """Run the two-pass atmospheric-parameter refinement for the supplied example.
 
-    Pass 1 reproduces the original diagnostic-line strategy:
-        vmic(all) -> [M/H](diagnostics) -> log g(diagnostics) ->
-        Teff(all selected lines) -> alpha(alpha-element lines).
+    ASF v2.0 fits vmic first and alpha last. The ordering of [M/H], log g, and
+    Teff should be chosen for each target according to the availability, strength,
+    and distinctiveness of their diagnostic lines. A parameter without a suitable
+    diagnostic subset should be placed last among these three and fitted with all
+    selected parameter lines.
 
-    Pass 2 is a narrow verification/refinement around the Pass-1 result.
-    vmic, [M/H], log g, and Teff use all parameter lines, while alpha remains
-    restricted to the alpha-element lines. Each parameter uses the most recently updated atmosphere from the
-    preceding Pass-2 sub-step. Local grids are subsets of the original grids
-    (centered only after rounding the Pass-1 result to the nearest allowed
-    global-grid value).
+    Pass 1 follows the target-specific diagnostic-line strategy encoded below.
+    Pass 2 is a narrow verification/refinement around the Pass-1 result and uses
+    all selected parameter lines for vmic, [M/H], log g, and Teff, while alpha
+    remains restricted to alpha-element lines. Each parameter uses the most
+    recently updated atmosphere from the preceding Pass-2 sub-step. Local grids
+    are subsets of the original grids, centered after rounding the Pass-1 result
+    to the nearest allowed global-grid value.
     """
     del iteration_results, line_lists
 
@@ -4938,7 +4950,7 @@ def run_autospecfit_abundance_pipeline(
                     parameter_refiner=parameter_refiner,
                     iteration_id=iteration_id,
                     stellar_parameters=used_parameters,
-                    # GJ205 refiner does not require in-memory abundance line objects;
+                    # The supplied parameter refiner does not require in-memory abundance line objects;
                     # all necessary abundance values are checkpointed below.
                     iteration_results=[],
                     mean_abundances=mean_history[:, iteration_id - 1],

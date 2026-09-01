@@ -61,16 +61,20 @@ ASN consists of two main modules:
 
 `AutoSpecFit_Abund_Param_v2_0.py` retains the abundance-fitting workflow above and adds stellar-parameter refinement between abundance iterations.
 
-For the current cool-dwarf implementation, the parameter refinement is performed sequentially, with only one parameter varied at a time. The default sequence is:
+For the current cool-dwarf implementation, parameter refinement is performed sequentially, with only one parameter varied at a time. `vmic` is fitted first and `[alpha/Fe]` is fitted last. The ordering of the three atmospheric parameters `[M/H]`, `log g`, and `Teff` is not fixed; instead, it is determined for each target according to the availability, strength, and distinctiveness of their parameter-specific diagnostic lines.
+
+In general, parameters with stronger and more distinct diagnostic lines are fitted earlier in the sequence, allowing the better-constrained parameters to be established before parameters with less distinctive or more degenerate spectral responses. If suitable diagnostic lines cannot be identified for one of these parameters, that parameter is placed last among `[M/H]`, `log g`, and `Teff` and is fitted using the full set of selected spectral lines rather than a parameter-specific diagnostic subset.
+
+The general fitting sequence is therefore:
 
 ```text
-vmic -> [M/H] -> log g -> Teff -> [alpha/Fe]
+vmic -> [M/H], log g, Teff (target-dependent order) -> [alpha/Fe]
 ```
 
 The parameter determination uses two passes:
 
-- **Pass 1:** searches the original/global parameter grids. Parameter-specific diagnostic lines may be used for `[M/H]` and `log g`, while `Teff` and `vmic` can use the full parameter line list when no separate diagnostic subset is adopted. `[alpha/Fe]` is determined from selected alpha-element lines.
-- **Pass 2:** repeats the same parameter sequence using local five-point grids centered on the Pass-1 solutions. Every Pass-2 trial value is an existing point from the corresponding Pass-1/original grid; Pass 2 never extends beyond the original parameter grid. The local window shifts inward when the Pass-1 solution lies near a grid boundary.
+- **Pass 1:** searches the original/global parameter grids. Parameter-specific diagnostic lines are used when suitable diagnostics have been identified. The ordering of `[M/H]`, `log g`, and `Teff` follows the relative strength and distinctiveness of their diagnostic lines for the target being analyzed. If no suitable diagnostic subset is available for a parameter, that parameter is placed last among these three parameters and fitted using the full set of selected spectral lines. `vmic` is fitted first using the full parameter line list, while `[alpha/Fe]` is fitted last using selected alpha-element lines.
+- **Pass 2:** repeats the adopted parameter sequence using local five-point grids centered on the Pass-1 solutions. Every Pass-2 trial value is an existing point from the corresponding Pass-1/original grid; Pass 2 never extends beyond the original parameter grid. The local window shifts inward when the Pass-1 solution lies near a grid boundary.
 
 Atmospheric-parameter and abundance iterations alternate until the adopted convergence conditions are satisfied. Once the final stellar parameters are accepted, ASF performs a dedicated final abundance determination, converts the native ASF abundance offsets to the final `[X/H]` scale using the adopted `[M/H]` and `[alpha/Fe]`, and propagates the atmospheric-parameter uncertainties into the elemental-abundance error budget.
 
