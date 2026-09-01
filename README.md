@@ -2,9 +2,9 @@
 
 **Automated Spectral Fitting Framework for Chemical Abundance Measurements of Cool Stars**
 
-AutoSpecFit (ASF) is an automated line-by-line spectral synthesis framework designed for high-resolution chemical abundance measurements of cool stars. ASF derives elemental abundances through line-by-line chi-square minimization by comparing synthetic spectra generated with Turbospectrum to observed spectra. Prior to each comparison, the observed spectrum is locally pseudo-continuum normalized relative to each synthetic spectrum independently using the AutoSpecNorm (ASN) framework.
+AutoSpecFit (ASF) is an automated line-by-line spectral synthesis framework designed for high-resolution chemical abundance measurements of cool stars. ASF derives elemental abundances through line-by-line chi-square minimization by comparing synthetic spectra generated with Turbospectrum to observed spectra. Prior to the comparison, the observed spectrum is locally pseudo-continuum normalized relative to each synthetic spectrum independently using the AutoSpecNorm (ASN) framework.
 
-ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospheric parameters supplied by the user. A future release, ASF v2.0, will introduce iterative stellar-parameter optimization between abundance iterations, enabling self-consistent determinations of effective temperature (Teff), surface gravity (log g), and overall metallicity ([M/H]) alongside elemental abundances. This extension will allow atmospheric parameters and chemical abundances to be refined simultaneously throughout the fitting process. 
+ASF currently includes two analysis scripts. `AutoSpecFit_Abund_v1_0.py` performs iterative elemental-abundance measurements for user-supplied, fixed stellar atmospheric parameters. `AutoSpecFit_Abund_Param_v2_0.py` extends the framework by alternating abundance determination with stellar-parameter refinement, allowing effective temperature (`Teff`), surface gravity (`log g`), overall metallicity (`[M/H]`), microturbulent velocity (`vmic`), and alpha enhancement (`[alpha/Fe]`) to be refined toward a self-consistent solution.
 
 ---
 
@@ -17,13 +17,19 @@ ASF v1.0 is designed for abundance measurements assuming fixed stellar atmospher
 ## Main Features
 
 - Automated line-by-line elemental abundance determination.
-- Local pseudo-continuum normalization of the observed spectrum with respect to each synthetic spectrum examined during the fitting process using AutoSpecNorm (ASN).
-- Abundance-dependent pseudo-continuum placement.
-- Line-by-line chi-square minimization.
-- Iterative abundnace refinement for self-consistent abundance measurements.
+- Local pseudo-continuum normalization of the observed spectrum using AutoSpecNorm (ASN).
+- Independent local normalization of the observed spectrum with respect to each synthetic spectrum evaluated during the fitting process.
+- Abundance-dependent pseudo-continuum placement for self-consistent abundance measurements.
+- Iterative refinement of elemental abundances.
+- Iterative stellar-parameter refinement in ASF v2.0.
+- Sequential one-parameter-at-a-time fitting to reduce parameter degeneracies.
+- Two-pass stellar-parameter determination: a broad Pass 1 followed by a local Pass 2 restricted to the original Pass-1 parameter grids.
+- Line-by-line chi-square minimization and uncertainty estimation.
+- Propagation of final atmospheric-parameter uncertainties into systematic abundance uncertainties.
+- Restart/checkpoint support for long abundance and parameter-fitting runs.
 - Designed for high-resolution spectra of cool stars.
 - Primarily tested on IGRINS spectra with resolving power R ≈ 45,000.
-- Compatible with Turbospectrum v15.1 through user-supplied external scripts.
+- Compatible with Turbospectrum v15.1 through user-supplied external synthesis scripts.
 
 ---
 
@@ -40,74 +46,103 @@ ASN consists of two main modules:
 
 ## Current ASF Workflow
 
-1. Read the observed stellar spectrum.
-2. Read species-specific line-list files.
-3. Generate abundance grids.
-4. Launch Turbospectrum calculations externally.
-5. Wait for synthetic spectra to become available.
-6. Perform local pseudo-continuum normalization with ASN.
-7. Compute line-by-line chi-square curves.
-8. Determine best-fit abundances and uncertainties.
-9. Update elemental abundances between iterations.
-10. Write final abundances and uncertainties.
+### ASF v1.0: Abundance Fitting with Fixed Stellar Parameters
+
+1. Read the observed stellar spectrum and species-specific line-list files.
+2. Generate the elemental-abundance grids and required Turbospectrum models.
+3. Perform independent local pseudo-continuum normalization with ASN for every synthetic spectrum.
+4. Compute line-by-line chi-square abundance curves.
+5. Determine individual-line abundances and uncertainties.
+6. Combine accepted lines into species-level abundances.
+7. Update the fixed elemental abundances and repeat the abundance fitting until convergence.
+8. Write the final elemental abundances and uncertainties.
+
+### ASF v2.0: Abundance + Stellar-Parameter Fitting
+
+`AutoSpecFit_Abund_Param_v2_0.py` retains the abundance-fitting workflow above and adds stellar-parameter refinement between abundance iterations.
+
+For the current cool-dwarf implementation, the parameter refinement is performed sequentially, with only one parameter varied at a time. The default sequence is:
+
+```text
+vmic -> [M/H] -> log g -> Teff -> [alpha/Fe]
+```
+
+The parameter determination uses two passes:
+
+- **Pass 1:** searches the original/global parameter grids. Parameter-specific diagnostic lines may be used for `[M/H]` and `log g`, while `Teff` and `vmic` can use the full parameter line list when no separate diagnostic subset is adopted. `[alpha/Fe]` is determined from selected alpha-element lines.
+- **Pass 2:** repeats the same parameter sequence using local five-point grids centered on the Pass-1 solutions. Every Pass-2 trial value is an existing point from the corresponding Pass-1/original grid; Pass 2 never extends beyond the original parameter grid. The local window shifts inward when the Pass-1 solution lies near a grid boundary.
+
+Atmospheric-parameter and abundance iterations alternate until the adopted convergence conditions are satisfied. Once the final stellar parameters are accepted, ASF performs a dedicated final abundance determination, converts the native ASF abundance offsets to the final `[X/H]` scale using the adopted `[M/H]` and `[alpha/Fe]`, and propagates the atmospheric-parameter uncertainties into the elemental-abundance error budget.
 
 ---
 
 ## Atmospheric Parameters
 
-ASF v1.0 requires the following stellar atmospheric parameters:
+### ASF v1.0
+
+`AutoSpecFit_Abund_v1_0.py` treats the stellar atmospheric parameters as fixed user-supplied inputs:
 
 - Effective temperature (`Teff`)
 - Surface gravity (`log g`)
 - Overall metallicity (`[M/H]`)
 
-Optional synthesis parameters include:
+Additional synthesis parameters include alpha enhancement (`[alpha/Fe]`), microturbulent velocity (`vmic`), and projected rotational velocity (`v sin i`), as required by the adopted Turbospectrum workflow.
 
+### ASF v2.0
+
+`AutoSpecFit_Abund_Param_v2_0.py` can iteratively refine:
+
+- Effective temperature (`Teff`)
+- Surface gravity (`log g`)
+- Overall metallicity (`[M/H]`)
 - Alpha enhancement (`[alpha/Fe]`)
 - Microturbulent velocity (`vmic`)
-- Projected rotational velocity (`v sin i`)
 
-Default values used in the Turbospectrum workflow are:
-
-- `[alpha/Fe] = +0.00`
-- `vmic = 1.00 km s^-1`
-- `v sin i = 0.00 km s^-1`
-
-Future ASF versions will include iterative stellar-parameter optimization.
+The parameter grids, diagnostic-line selections, convergence tolerances, fitting order, and Turbospectrum execution settings are defined in the configuration section of the script and should be adapted to the target star and analysis setup. The parameter-fitting strategy is therefore configurable rather than a universal set of hard-coded stellar values.
 
 ---
 
-## Abundance Scale and Conversion to [X/H]
+## Abundance Scale and Conversion to [X/H] in ASF v2.0
 
-Abundances reported by ASF correspond to abundance offsets relative to the abundance patern of the adopted model atmosphere. They are therefore not direct `[X/H]` abundances.
+In `AutoSpecFit_Abund_Param_v2_0.py`, ASF determines an **abundance offset**, `ASF(X)`, for each fitted element. This quantity represents the elemental abundance change relative to the abundance pattern of the model atmosphere used for the spectral synthesis. The native ASF abundance offset is therefore not, by itself, the standard `[X/H]` abundance.
 
-For non-alpha elements, the final abundance is computed as:
+Because ASF v2.0 iteratively refines `[M/H]` and `[alpha/Fe]` together with the other stellar parameters, the conversion of the final abundance offsets to `[X/H]` uses the **final adopted fitted atmospheric parameters**, not the initial values supplied at the beginning of the run.
 
-```text
-[X/H] = [M/H]input + ASF(X)
-```
-
-For alpha elements (e.g., O, Mg, Si, Ca, and Ti), the alpha enhancement adopted in the model atmosphere must also be included:
+For a non-alpha element, the final abundance is:
 
 ```text
-[X/H] = [M/H]input + [alpha/Fe]input + ASF(X)
+[X/H] = [M/H]final + ASF(X)
 ```
 
-where `ASF(X)` is the abundance offset measured by ASF for element `X`, `[M/H]input` is the input metallicity supplied by the user, and `[alpha/Fe]input` is the input alpha-element enhancement also provided by the user.
+For an alpha element, the final abundance is:
+
+```text
+[X/H] = [M/H]final + [alpha/Fe]final + ASF(X)
+```
+
+where `ASF(X)` is the abundance offset measured by ASF for element `X`, `[M/H]final` is the final adopted metallicity from the ASF v2.0 parameter solution, and `[alpha/Fe]final` is the final adopted alpha-element enhancement. The alpha-element set used in the calculation is defined by `alpha_species` in the configuration section of the script. In the current default configuration, these species are O/OH, Mg, Ca, and Ti.
+
+The final ASF v2.0 abundance table retains the native `ASF_Offset` for traceability and also reports the converted `Final_X_H` abundance.
 
 For example, for magnesium (Mg), which is an alpha element:
 
 ```text
-[M/H]input      = -0.30
-[alpha/Fe]input = +0.12
+[M/H]final      = -0.30
+[alpha/Fe]final = +0.12
 ASF(Mg)         = +0.15
 
 [Mg/H] = -0.30 + 0.12 + 0.15 = -0.03
 ```
 
+The abundance uncertainties reported by ASF v2.0 are associated with the final `[X/H]` abundance. The random uncertainty from the dedicated final abundance fit is unchanged by adding the nominal final atmospheric-composition terms. Systematic abundance uncertainties are evaluated by perturbing the final stellar parameters one at a time, converting both the nominal and perturbed abundance offsets to their corresponding `[X/H]` values, and measuring the resulting abundance shifts. The systematic contributions are combined in quadrature, and the final total abundance uncertainty is:
+
+```text
+Final_Total_Error = sqrt(Final_Random_Error^2 + Final_Systematic_Error^2)
+```
+
 The abundance notation and formulation adopted by ASF follow:
 
-Hejazi, N., Lépine, S., Nordlander, T., Jao, W.-C., Coria, D. R., &
+Hejazi, N., Lépine, S., Nordlander, T., Jao, W.-C., Coria, D. R., &  
 Lester, K. V. 2025, AJ, 170, 18
 
 DOI: 10.3847/1538-3881/add696
@@ -142,6 +177,7 @@ AutoSpecFit/
 ├── src/
 │   ├── __init__.py
 │   ├── AutoSpecFit_Abund_v1_0.py
+│   ├── AutoSpecFit_Abund_Param_v2_0.py
 │   ├── AutoSpecNorm_Regions.py
 │   └── AutoSpecNorm_Points.py
 ├── examples/
@@ -178,9 +214,9 @@ The example demonstrates selection of local normalization points, local pseudo-c
 
 ## Turbospectrum Compatibility
 
-ASF v1.0 has been developed and tested using Turbospectrum v15.1. ASF does not perform spectral synthesis internally. Synthetic spectra are generated externally through user-supplied scripts, and ASF then performs normalization and abundance fitting.
+ASF has primarily been developed and tested using Turbospectrum v15.1. ASF does not perform spectral synthesis internally. Instead, it prepares the required model grids, calls user-supplied external Turbospectrum scripts, waits for the expected synthetic spectra, and then performs normalization and spectral fitting.
 
-Users working with different Turbospectrum versions or non-SLURM systems may need to modify the synthesis-launching and job-monitoring sections of the ASF workflow.
+ASF v2.0 requires synthetic spectra spanning both the abundance grids and the adopted stellar-parameter grids. Users working with different Turbospectrum versions, atmosphere grids, execution scripts, or non-SLURM systems may need to modify the synthesis-launching, model-naming, and job-monitoring sections of the workflow.
 
 ---
 
