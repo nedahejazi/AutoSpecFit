@@ -2080,27 +2080,6 @@ def run_iteration(
     return species_results
 
 
-def convergence_rule_for_iteration(
-    iteration_id: int,
-    config: AutoSpecFitConfig,
-) -> Tuple[float, int, str]:
-    """Return the convergence tolerance and allowed non-converged species count.
-
-    The convergence rule becomes progressively more flexible with iteration
-    number. Early iterations require all species to converge tightly. Later
-    iterations allow one species to remain non-converged, in which case that
-    species is treated as oscillating and its final abundance is estimated
-    from its late-iteration history.
-    """
-    if iteration_id < config.intermediate_convergence_start_iteration:
-        return config.early_convergence_tolerance, 0, "strict early convergence"
-
-    if iteration_id < config.late_convergence_start_iteration:
-        return config.intermediate_convergence_tolerance, 1, "intermediate convergence"
-
-    return config.late_convergence_tolerance, 1, "late convergence"
-
-
 def evaluate_convergence_status(
     change: np.ndarray,
     iteration_id: int,
