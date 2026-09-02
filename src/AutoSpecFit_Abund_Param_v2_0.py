@@ -2748,11 +2748,12 @@ def rebuild_history_outputs_from_restart(
         except Exception as exc:
             LOGGER.warning("Could not migrate legacy GJ205 parameter history: %s", exc)
 
-    # If the checkpoint is after a completed parameter cycle, replace that latest
+    # If the checkpoint is after a completed parameter cycle, abundance
+    # iteration N has produced parameter iteration N+1. Replace that parameter
     # iteration with the richer checkpointed values/errors.
     if next_stage in ("convergence", "finished"):
         update_parameter_history_table(
-            parameter_path, iteration_id, current_stellar_parameters,
+            parameter_path, iteration_id + 1, current_stellar_parameters,
             last_real_parameter_values, last_parameter_errors,
             last_parameter_consistency_shifts,
         )
@@ -4769,6 +4770,41 @@ def run_autospecfit_abundance_pipeline(
     abundance_history_path = Path(config.output_dir) / config.abundance_history_file
     legacy_parameter_history_path = Path(config.output_dir) / config.legacy_parameter_history_file
 
+    if checkpoint is None:
+        # Parameter iteration 1 is the original adopted atmosphere. Abundance
+        # iteration 1 is evaluated with exactly this parameter set. Every later
+        # parameter iteration N is obtained after abundance iteration N-1 and
+        # is then used by abundance iteration N.
+        initial_real_values = {
+            "teff": float(current_stellar_parameters.teff),
+            "logg": float(current_stellar_parameters.logg),
+            "metallicity": float(current_stellar_parameters.metallicity),
+            "alpha": float(current_stellar_parameters.alpha),
+            "vmic": float(current_stellar_parameters.vmic),
+        }
+        initial_errors = {
+            "teff": np.nan,
+            "logg": np.nan,
+            "metallicity": np.nan,
+            "alpha": np.nan,
+            "vmic": np.nan,
+        }
+        initial_consistency_shifts = {
+            "teff": np.nan,
+            "logg": np.nan,
+            "metallicity": np.nan,
+            "alpha": np.nan,
+            "vmic": np.nan,
+        }
+        update_parameter_history_table(
+            path=parameter_history_path,
+            iteration_id=1,
+            stellar_parameters=current_stellar_parameters,
+            real_parameter_values=initial_real_values,
+            parameter_errors=initial_errors,
+            parameter_consistency_shifts=initial_consistency_shifts,
+        )
+
     if checkpoint is not None:
         rebuild_history_outputs_from_restart(
             config=config,
@@ -4917,9 +4953,10 @@ def run_autospecfit_abundance_pipeline(
                     random_errors=current_abundance_errors,
                 )
 
-                # Every iterative abundance cycle is followed by parameter refinement,
-                # including the maximum numbered cycle. A dedicated final abundance
-                # determination is performed only after the final accepted parameters.
+                # Abundance iteration N is followed by the refinement that
+                # produces parameter iteration N+1. If convergence is accepted,
+                # the dedicated final abundance is also iteration N+1 and no
+                # parameter refinement follows it.
                 if config.refine_parameters_after_each_iteration:
                     next_stage = "parameter"
                 else:
@@ -4945,10 +4982,11 @@ def run_autospecfit_abundance_pipeline(
             # -------------------------------------------------------------
             if next_stage == "parameter":
                 used_parameters = current_stellar_parameters
+                parameter_iteration_id = iteration_id + 1
 
                 refinement = perform_parameter_refinement(
                     parameter_refiner=parameter_refiner,
-                    iteration_id=iteration_id,
+                    iteration_id=parameter_iteration_id,
                     stellar_parameters=used_parameters,
                     # The supplied parameter refiner does not require in-memory abundance line objects;
                     # all necessary abundance values are checkpointed below.
@@ -4974,7 +5012,7 @@ def run_autospecfit_abundance_pipeline(
 
                 write_parameter_history_row(
                     legacy_parameter_history_path,
-                    iteration_id,
+                    parameter_iteration_id,
                     used_parameters,
                     refinement.stellar_parameters,
                     refinement.converged,
@@ -4996,7 +5034,7 @@ def run_autospecfit_abundance_pipeline(
 
                 update_parameter_history_table(
                     path=parameter_history_path,
-                    iteration_id=iteration_id,
+                    iteration_id=parameter_iteration_id,
                     stellar_parameters=current_stellar_parameters,
                     real_parameter_values=refinement.real_parameter_values,
                     parameter_errors=refinement.parameter_errors,
@@ -5015,9 +5053,10 @@ def run_autospecfit_abundance_pipeline(
                     )
 
                 LOGGER.info(
-                    "Parameter refinement after iteration %d: "
+                    "Parameter iteration %d, produced after abundance iteration %d: "
                     "vmic %s -> %s, [M/H] %s -> %s, logg %s -> %s, "
                     "Teff %s -> %s, [alpha/Fe] %s -> %s",
+                    parameter_iteration_id,
                     iteration_id,
                     used_parameters.vmic,
                     current_stellar_parameters.vmic,
