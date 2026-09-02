@@ -922,6 +922,7 @@ def write_final_abundance_table(
     species: SpeciesConfig,
     config: AutoSpecFitConfig,
     nan_replacement_notes: Optional[List[str]] = None,
+    per_parameter_systematics: Optional[Dict[str, np.ndarray]] = None,
     systematic_errors: Optional[np.ndarray] = None,
     total_errors: Optional[np.ndarray] = None,
 ) -> None:
@@ -946,6 +947,31 @@ def write_final_abundance_table(
     if total_errors is None:
         total_errors = random_errors.copy()
 
+    if per_parameter_systematics is None:
+        per_parameter_systematics = {}
+    systematic_vmic = np.asarray(
+        per_parameter_systematics.get("vmic", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
+    systematic_metallicity = np.asarray(
+        per_parameter_systematics.get(
+            "metallicity", np.full_like(random_errors, np.nan)
+        ),
+        dtype=float,
+    )
+    systematic_logg = np.asarray(
+        per_parameter_systematics.get("logg", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
+    systematic_teff = np.asarray(
+        per_parameter_systematics.get("teff", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
+    systematic_alpha = np.asarray(
+        per_parameter_systematics.get("alpha", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
+
     final_xh_not_rounded = convert_asf_offsets_to_xh(
         final_not_rounded, final_stellar_parameters, species, config
     )
@@ -957,6 +983,11 @@ def write_final_abundance_table(
             "ASF_Offset": final_rounded,
             "Final_X_H": final_xh_rounded,
             "Final_Random_Error": random_errors,
+            "Systematic_vmic": systematic_vmic,
+            "Systematic_M_H": systematic_metallicity,
+            "Systematic_logg": systematic_logg,
+            "Systematic_Teff": systematic_teff,
+            "Systematic_alpha": systematic_alpha,
             "Final_Systematic_Error": systematic_errors,
             "Final_Total_Error": total_errors,
         }
@@ -969,7 +1000,8 @@ def write_final_abundance_table(
             "# Non-alpha: [X/H] = ASF_Offset + [M/H]_final\n"
             "# Alpha:     [X/H] = ASF_Offset + [M/H]_final + [alpha/Fe]_final\n"
             "# Random error is unchanged by the abundance-scale conversion.\n"
-            "# Systematic errors are evaluated directly on [X/H] under each parameter perturbation.\n"
+            "# Per-parameter systematic columns are the mean absolute, linearly scaled +/-1-sigma [X/H] shifts.\n"
+            "# Final_Systematic_Error is the quadrature sum of the five per-parameter systematic columns.\n"
             "# Total error = sqrt(Random_Error^2 + Systematic_Error^2)\n"
         )
         table.to_csv(handle, sep=" ", index=False, header=True, float_format="%.6f", na_rep="nan")
@@ -4443,10 +4475,12 @@ def run_systematic_abundance_error_analysis(
     perturbed numerical value is rounded to the nearest value on that
     parameter's actual fitting grid before synthesis. For each element and
     parameter, both the nominal and perturbed ASF offsets are converted to the
-    corresponding physical [X/H] scale. The systematic contribution is the
-    largest absolute [X/H] shift among the distinct +/- perturbations. Independent parameter
-    contributions are then added in quadrature, and the resulting systematic
-    error is added in quadrature to the chi-square random abundance error.
+    corresponding physical [X/H] scale. Each measured abundance shift is
+    linearly rescaled from the actual grid displacement to the requested
+    1-sigma displacement. The systematic contribution from one parameter is
+    the mean of the available absolute, rescaled +/-1-sigma shifts. Independent
+    parameter contributions are then added in quadrature, and the resulting
+    systematic error is added in quadrature to the random abundance error.
 
     This one-at-a-time procedure does not include covariance terms between
     atmospheric parameters.
@@ -4498,7 +4532,7 @@ def run_systematic_abundance_error_analysis(
             )
             continue
 
-        shifts: List[np.ndarray] = []
+        scaled_shifts: List[np.ndarray] = []
         used_grid_values = set()
 
         for sign, sign_label in ((+1.0, "plus"), (-1.0, "minus")):
@@ -4517,6 +4551,19 @@ def run_systematic_abundance_error_analysis(
                 requested_value,
             )
 
+            # If sigma is smaller than half a grid step, evaluate the adjacent
+            # grid point in the requested direction and linearly scale that
+            # response to the reported 1-sigma displacement.
+            if np.isclose(rounded_value, nominal_value, atol=1.0e-8, rtol=0.0):
+                grid = np.asarray(parameter_grid(config, parameter_name), dtype=float)
+                nominal_index = int(np.argmin(np.abs(grid - nominal_value)))
+                adjacent_index = nominal_index + (1 if sign > 0 else -1)
+                if 0 <= adjacent_index < len(grid):
+                    rounded_value = float(grid[adjacent_index])
+                    rounded_string = parameter_grid_strings(
+                        parameter_name, config
+                    )[adjacent_index]
+
             perturbation_rows.append(
                 (
                     parameter_name,
@@ -4528,8 +4575,7 @@ def run_systematic_abundance_error_analysis(
                 )
             )
 
-            # If +/- sigma rounds back to the nominal grid point, it does not
-            # constitute a distinct perturbation and contributes zero shift.
+            # At a hard boundary, omit an unavailable side and use the other.
             if (
                 not np.isfinite(rounded_value)
                 or np.isclose(rounded_value, nominal_value, atol=1.0e-8, rtol=0.0)
@@ -4560,11 +4606,23 @@ def run_systematic_abundance_error_analysis(
             perturbed_xh = convert_asf_offsets_to_xh(
                 perturbed_abundances, perturbed_parameters, species, config
             )
-            shifts.append(np.abs(perturbed_xh - nominal_xh))
+            actual_displacement = abs(float(rounded_value) - nominal_value)
+            if not np.isfinite(actual_displacement) or actual_displacement <= 0:
+                continue
+            scale_to_one_sigma = sigma / actual_displacement
+            scaled_shifts.append(
+                np.abs(perturbed_xh - nominal_xh) * scale_to_one_sigma
+            )
 
-        if shifts:
-            stacked = np.vstack(shifts)
-            per_parameter[parameter_name] = np.nanmax(stacked, axis=0)
+        if scaled_shifts:
+            stacked = np.vstack(scaled_shifts)
+            finite = np.isfinite(stacked)
+            counts = np.sum(finite, axis=0)
+            sums = np.nansum(stacked, axis=0)
+            averaged = np.full(species.n_species, np.nan, dtype=float)
+            available = counts > 0
+            averaged[available] = sums[available] / counts[available]
+            per_parameter[parameter_name] = averaged
         else:
             # Both +/-1sigma rounded to the nominal parameter grid point.
             per_parameter[parameter_name] = np.zeros(species.n_species, dtype=float)
@@ -5305,7 +5363,7 @@ def run_autospecfit_abundance_pipeline(
                     (
                         systematic_errors,
                         total_abundance_errors,
-                        _per_parameter_systematics,
+                        per_parameter_systematics,
                     ) = run_systematic_abundance_error_analysis(
                         final_stellar_parameters=current_stellar_parameters,
                         parameter_errors=last_parameter_errors,
@@ -5327,6 +5385,7 @@ def run_autospecfit_abundance_pipeline(
                         species=species,
                         config=config,
                         nan_replacement_notes=nan_replacement_notes,
+                        per_parameter_systematics=per_parameter_systematics,
                         systematic_errors=systematic_errors,
                         total_errors=total_abundance_errors,
                     )

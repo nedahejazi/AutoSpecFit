@@ -924,6 +924,7 @@ def write_final_abundance_table(
     species: SpeciesConfig,
     config: AutoSpecFitConfig,
     nan_replacement_notes: Optional[List[str]] = None,
+    per_parameter_systematics: Optional[Dict[str, np.ndarray]] = None,
     systematic_errors: Optional[np.ndarray] = None,
     total_errors: Optional[np.ndarray] = None,
 ) -> None:
@@ -948,6 +949,27 @@ def write_final_abundance_table(
     if total_errors is None:
         total_errors = random_errors.copy()
 
+    if per_parameter_systematics is None:
+        per_parameter_systematics = {}
+    systematic_vmic = np.asarray(
+        per_parameter_systematics.get("vmic", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
+    systematic_metallicity = np.asarray(
+        per_parameter_systematics.get(
+            "metallicity", np.full_like(random_errors, np.nan)
+        ),
+        dtype=float,
+    )
+    systematic_logg = np.asarray(
+        per_parameter_systematics.get("logg", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
+    systematic_teff = np.asarray(
+        per_parameter_systematics.get("teff", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
+
     final_xh_not_rounded = convert_asf_offsets_to_xh(
         final_not_rounded, final_stellar_parameters, species, config
     )
@@ -959,6 +981,10 @@ def write_final_abundance_table(
             "ASF_Offset": final_rounded,
             "Final_X_H": final_xh_rounded,
             "Final_Random_Error": random_errors,
+            "Systematic_vmic": systematic_vmic,
+            "Systematic_M_H": systematic_metallicity,
+            "Systematic_logg": systematic_logg,
+            "Systematic_Teff": systematic_teff,
             "Final_Systematic_Error": systematic_errors,
             "Final_Total_Error": total_errors,
         }
@@ -971,7 +997,9 @@ def write_final_abundance_table(
             "# Non-alpha: [X/H] = ASF_Offset + [M/H]_final\n"
             "# Alpha:     [X/H] = ASF_Offset + [M/H]_final + [alpha/Fe]_fixed\n"
             "# Random error is unchanged by the abundance-scale conversion.\n"
-            "# Systematic errors are evaluated directly on [X/H] under each parameter perturbation.\n"
+            "# Per-parameter systematic columns are the mean absolute, linearly scaled +/-1-sigma [X/H] shifts.\n"
+            "# Fixed [alpha/Fe] is not varied and does not contribute to the systematic error.\n"
+            "# Final_Systematic_Error is the quadrature sum of the four per-parameter systematic columns.\n"
             "# Total error = sqrt(Random_Error^2 + Systematic_Error^2)\n"
         )
         table.to_csv(handle, sep=" ", index=False, header=True, float_format="%.6f", na_rep="nan")
@@ -5382,7 +5410,7 @@ def run_autospecfit_abundance_pipeline(
                     (
                         systematic_errors,
                         total_abundance_errors,
-                        _per_parameter_systematics,
+                        per_parameter_systematics,
                     ) = run_systematic_abundance_error_analysis(
                         final_stellar_parameters=current_stellar_parameters,
                         parameter_errors=last_parameter_errors,
@@ -5404,6 +5432,7 @@ def run_autospecfit_abundance_pipeline(
                         species=species,
                         config=config,
                         nan_replacement_notes=nan_replacement_notes,
+                        per_parameter_systematics=per_parameter_systematics,
                         systematic_errors=systematic_errors,
                         total_errors=total_abundance_errors,
                     )
@@ -5451,9 +5480,10 @@ def run_autospecfit_abundance_pipeline(
 
 if __name__ == "__main__":
     CONFIG = AutoSpecFitConfig(
-        # No per-iteration TS skips: iteration 1 and all later abundance
-        # iterations follow the global run_turbospectrum=True setting.
-        run_ts_by_iteration={},
+        # The original iteration-1 abundance models already exist. Skip TS
+        # only for abundance iteration 1; later iterations use the global
+        # run_turbospectrum=True setting.
+        run_ts_by_iteration={1: False},
         run_parameter_ts_by_iteration={},
         refine_parameters_after_each_iteration=True,
     )
