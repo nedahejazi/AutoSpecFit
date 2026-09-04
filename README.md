@@ -28,7 +28,7 @@ ASF currently includes two analysis scripts. `AutoSpecFit_Abund_v1_0.py` perform
 - Propagation of final atmospheric-parameter uncertainties into systematic abundance uncertainties.
 - Restart/checkpoint support for long abundance and parameter-fitting runs.
 - Designed for high-resolution spectra of cool stars.
-- Primarily tested on IGRINS spectra with resolving power R ≈ 45,000.
+- Primarily tested on IGRINS spectra with resolving power R ≈ 45,000, but also applicable to high-resolution optical spectra.
 - Compatible with Turbospectrum v15.1 through user-supplied external synthesis scripts.
 
 ---
