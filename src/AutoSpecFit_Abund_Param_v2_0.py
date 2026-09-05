@@ -1688,6 +1688,7 @@ def compute_line_chi2_curve(
     config: AutoSpecFitConfig,
     iteration_id: int,
     element_name: str,
+    log_context: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute chi-square values for one line over the abundance grid.
 
@@ -1778,10 +1779,15 @@ def compute_line_chi2_curve(
         chi2_curve[abundance_index] = chi2_value
         valid_abundances.append(abundances[abundance_index])
 
+        chi2_context = (
+            f"ABUNDANCE ITERATION {iteration_id}"
+            if log_context is None
+            else log_context
+        )
         LOGGER.info(
-            "CHI2 | ABUNDANCE ITERATION %d | ELEMENT %s | line %.3f | "
+            "CHI2 | %s | ELEMENT %s | line %.3f | "
             "grid %d/%d | abundance %+.3f | chi2=%.6e",
-            iteration_id,
+            chi2_context,
             element_name,
             line_center,
             abundance_index + 1,
@@ -1932,6 +1938,7 @@ def fit_species_in_iteration(
     config: AutoSpecFitConfig,
     abundance_grid: np.ndarray,
     log_handle=None,
+    log_context: Optional[str] = None,
 ) -> SpeciesIterationResult:
     """Fit all selected lines for one species in one iteration.
 
@@ -1962,6 +1969,7 @@ def fit_species_in_iteration(
             config=config,
             iteration_id=iteration_id,
             element_name=element_name,
+            log_context=log_context,
         )
 
         best_grid = best_grid_abundance(abundance_grid, chi2_curve)
@@ -4352,6 +4360,7 @@ def gj205_parameter_refiner(
 def run_fixed_atmosphere_abundance_solution(
     label: str,
     stellar_parameters: StellarParameters,
+    log_context: Optional[str],
     fixed_final_abundances: np.ndarray,
     species: SpeciesConfig,
     line_lists: List[LineList],
@@ -4435,6 +4444,7 @@ def run_fixed_atmosphere_abundance_solution(
             config=config,
             abundance_grid=abundance_grid,
             log_handle=None,
+            log_context=log_context,
         )
         results.append(result)
 
@@ -4591,9 +4601,39 @@ def run_systematic_abundance_error_analysis(
                 use_exact_grid_format=True,
             )
 
+            parameter_display_names = {
+                "vmic": "vmic",
+                "metallicity": "[M/H]",
+                "logg": "log g",
+                "teff": "Teff",
+                "alpha": "[alpha/Fe]",
+            }
+
+            if parameter_name == "teff":
+                systematic_log_context = (
+                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
+                    f"{float(rounded_value):.0f} K"
+                )
+            elif parameter_name == "vmic":
+                systematic_log_context = (
+                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
+                    f"{float(rounded_value):.2f} km/s"
+                )
+            elif parameter_name in ("metallicity", "alpha"):
+                systematic_log_context = (
+                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
+                    f"{float(rounded_value):+.2f}"
+                )
+            else:
+                systematic_log_context = (
+                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
+                    f"{float(rounded_value):.2f}"
+                )
+
             perturbed_abundances = run_fixed_atmosphere_abundance_solution(
                 label=f"{parameter_name}_{sign_label}_{rounded_string}",
                 stellar_parameters=perturbed_parameters,
+                log_context=systematic_log_context,
                 fixed_final_abundances=final_abundances,
                 species=species,
                 line_lists=line_lists,
