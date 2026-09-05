@@ -29,25 +29,43 @@ def _select_polynomial_order(wavelength_points):
     normalization points use a lower-order polynomial to avoid unstable fits,
     while denser and more uniformly distributed points can support a higher
     order.
+
+    The thresholds and scientific behavior are unchanged from the original
+    implementation. The only added safeguards are handling very small point
+    sets before evaluating wavelength gaps and ensuring that adjacent gaps are
+    evaluated in wavelength order.
     """
+    wavelength_points = np.asarray(wavelength_points)
+    n_points = wavelength_points.size
+
+    # With three or fewer points, always use a first-order polynomial.
+    # Checking this first also avoids np.max(np.diff(...)) on an empty array
+    # when zero or one point is available.
+    if n_points <= 3:
+        return 1
+
+    # Normalization points are normally already wavelength ordered, but sort
+    # only when necessary so that "adjacent" gaps always have the intended
+    # meaning without adding avoidable work in the usual case.
+    if np.any(np.diff(wavelength_points) < 0):
+        wavelength_points = np.sort(wavelength_points)
+
     max_gap = np.max(np.diff(wavelength_points))
 
-    if len(wavelength_points) <= 3 or max_gap >= 15:
+    # Very sparse sampling takes precedence over the point-count rules.
+    if max_gap >= 15:
         return 1
 
-    if len(wavelength_points) == 4 and max_gap >= 10:
-        return 1
-
-    if len(wavelength_points) == 4 and max_gap < 10:
+    if n_points == 4:
+        if max_gap >= 10:
+            return 1
         return 2
 
-    if len(wavelength_points) > 4 and max_gap >= 3:
+    # More than four normalization points.
+    if max_gap >= 3:
         return 2
 
-    if len(wavelength_points) > 4 and max_gap < 3:
-        return 3
-
-    return 1
+    return 3
 
 
 def _remove_deepest_point_if_safe(
@@ -103,26 +121,23 @@ def _remove_boundary_point_if_safe(
         and len(left_points) > 1
         and len(lam_cut_work) >= 3
     ):
-        lam_cut_work = lam_cut_work[lam_cut_work != lam_star_cut[0]]
-        flux_interp_model_cut_work = flux_interp_model_cut_work[
-            flux_interp_model_cut_work != flux_interp_model_cut[0]
-        ]
-        flux_star_cut_work = flux_star_cut_work[
-            flux_star_cut_work != flux_star_cut[0]
-        ]
+        # Apply one common mask to wavelength, observed flux, and model flux
+        # so the three arrays always remain synchronized.
+        keep = lam_cut_work != lam_star_cut[0]
+        lam_cut_work = lam_cut_work[keep]
+        flux_interp_model_cut_work = flux_interp_model_cut_work[keep]
+        flux_star_cut_work = flux_star_cut_work[keep]
 
     elif (
         lam_star_cut[-1] in lam_cut_work
         and len(right_points) > 1
         and len(lam_cut_work) >= 3
     ):
-        lam_cut_work = lam_cut_work[lam_cut_work != lam_star_cut[-1]]
-        flux_interp_model_cut_work = flux_interp_model_cut_work[
-            flux_interp_model_cut_work != flux_interp_model_cut[-1]
-        ]
-        flux_star_cut_work = flux_star_cut_work[
-            flux_star_cut_work != flux_star_cut[-1]
-        ]
+        # Apply the same positional mask to all associated arrays.
+        keep = lam_cut_work != lam_star_cut[-1]
+        lam_cut_work = lam_cut_work[keep]
+        flux_interp_model_cut_work = flux_interp_model_cut_work[keep]
+        flux_star_cut_work = flux_star_cut_work[keep]
 
     return lam_cut_work, flux_interp_model_cut_work, flux_star_cut_work
 

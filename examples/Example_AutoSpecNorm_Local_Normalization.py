@@ -109,8 +109,8 @@ class AutoSpecNormExampleConfig:
     # points in the synthetic and observed spectra.
     limit_model: float = 0.95
     limit_star: float = 0.95
-    peak_index_model: float = 0.002
-    peak_index_star: float = 0.002
+    peak_index_model: float = 0.0019
+    peak_index_star: float = 0.0019
 
     # ------------------------------------------------------------------
     # Plot settings
