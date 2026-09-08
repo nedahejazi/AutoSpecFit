@@ -2993,7 +2993,10 @@ def parameter_grid_strings(
             )
         else:
             values = np.arange(-0.40, 0.40 + 0.05, 0.10)
-        return tuple(f"{float(value):+.2f}" for value in values)
+        return tuple(
+            f"{(0.0 if abs(float(value)) < 5.0e-9 else float(value)):+.2f}"
+            for value in values
+        )
     if parameter_name == "logg":
         if config is not None:
             values = np.arange(
@@ -3018,7 +3021,10 @@ def parameter_grid_strings(
         values = config.alpha_values if config is not None else (
             -0.20, -0.10, 0.00, 0.10, 0.20, 0.30, 0.40
         )
-        return tuple(f"{float(value):+.2f}" for value in values)
+        return tuple(
+            f"{(0.0 if abs(float(value)) < 5.0e-9 else float(value)):+.2f}"
+            for value in values
+        )
     if parameter_name == "vmic":
         values = config.vmic_values if config is not None else (
             0.00, 0.20, 0.40, 0.60, 0.80, 1.00, 1.20, 1.40
