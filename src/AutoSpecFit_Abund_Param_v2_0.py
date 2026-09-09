@@ -2554,8 +2554,13 @@ def load_parameter_progress(
 
     # Protect against accidentally reusing a checkpoint from a different
     # atmosphere/run that happens to have the same iteration number.
-    saved_start = stellar_parameters_from_dict(payload["starting_parameters"])
-    if stellar_parameters_to_dict(saved_start) != stellar_parameters_to_dict(starting_parameters):
+    saved_start = round_all_stellar_parameters_to_grids(
+        config, stellar_parameters_from_dict(payload["starting_parameters"])
+    )
+    canonical_starting_parameters = round_all_stellar_parameters_to_grids(
+        config, starting_parameters
+    )
+    if stellar_parameters_to_dict(saved_start) != stellar_parameters_to_dict(canonical_starting_parameters):
         LOGGER.warning(
             "Ignoring parameter-progress checkpoint for iteration %d because "
             "its starting atmosphere differs from the current one.",
@@ -2563,8 +2568,8 @@ def load_parameter_progress(
         )
         return None
 
-    payload["current_parameters_obj"] = stellar_parameters_from_dict(
-        payload["current_parameters"]
+    payload["current_parameters_obj"] = round_all_stellar_parameters_to_grids(
+        config, stellar_parameters_from_dict(payload["current_parameters"])
     )
     payload["parameter_errors_dict"] = {
         key: (np.nan if value is None else float(value))
@@ -2775,12 +2780,15 @@ def rebuild_history_outputs_from_restart(
             legacy = pd.read_csv(legacy_path, delim_whitespace=True)
             for _, row in legacy.iterrows():
                 it = int(row["Iteration"])
-                params = StellarParameters(
-                    teff=str(row["Teff_Refined"]),
-                    logg=str(row["logg_Refined"]),
-                    metallicity=str(row["MH_Refined"]),
-                    alpha=str(row["alpha_Refined"]),
-                    vmic=str(row["vmic_Refined"]),
+                params = round_all_stellar_parameters_to_grids(
+                    config,
+                    StellarParameters(
+                        teff=str(row["Teff_Refined"]),
+                        logg=str(row["logg_Refined"]),
+                        metallicity=str(row["MH_Refined"]),
+                        alpha=str(row["alpha_Refined"]),
+                        vmic=str(row["vmic_Refined"]),
+                    ),
                 )
                 update_parameter_history_table(
                     parameter_path, it, params, {}, {}, {},
@@ -3053,7 +3061,9 @@ def round_parameter_to_nearest_grid(
         return np.nan, ""
 
     index = int(np.argmin(np.abs(grid - float(value))))
-    return float(grid[index]), strings[index]
+    # Reconstruct the numeric value from the canonical string so tiny
+    # floating-point artifacts at nominal zero cannot propagate internally.
+    return float(strings[index]), strings[index]
 
 
 def format_parameter_value(parameter_name: str, value: float) -> str:
