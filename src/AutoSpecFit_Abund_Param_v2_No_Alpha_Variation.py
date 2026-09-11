@@ -550,7 +550,7 @@ class AutoSpecFitConfig:
     second_pass_logg_half_width: float = 0.10
     second_pass_teff_half_width: float = 50.0
 
-    # Cumulative history tables. The legacy row-style parameter history is kept
+    # Cumulative vertical history tables. The legacy row-style parameter history is kept
     # for restart compatibility with older runs produced by this example setup.
     abundance_history_file: str = "ASF_Abundance_History_GJ205.txt"
     parameter_history_file: str = "ASF_Parameter_History_GJ205.txt"
@@ -2661,6 +2661,54 @@ def write_parameter_history_row(
 
 
 
+def _read_vertical_history_blocks(path: Path) -> Dict[int, List[str]]:
+    """Read iteration blocks from an ASF vertical history file."""
+    path = Path(path)
+    blocks: Dict[int, List[str]] = {}
+    if not path.exists() or path.stat().st_size == 0:
+        return blocks
+
+    lines = path.read_text().splitlines()
+    current_iteration: Optional[int] = None
+    current_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("Iteration "):
+            if current_iteration is not None:
+                blocks[current_iteration] = current_lines
+            try:
+                current_iteration = int(stripped.split()[1])
+            except (IndexError, ValueError):
+                current_iteration = None
+            current_lines = [line] if current_iteration is not None else []
+        elif current_iteration is not None:
+            current_lines.append(line)
+
+    if current_iteration is not None:
+        blocks[current_iteration] = current_lines
+
+    return blocks
+
+
+def _write_vertical_history_blocks(
+    path: Path,
+    header_lines: List[str],
+    blocks: Dict[int, List[str]],
+) -> None:
+    """Write ASF history blocks in increasing iteration order."""
+    path = Path(path)
+    with open(path, "w") as handle:
+        for line in header_lines:
+            handle.write(f"{line}\n")
+        handle.write("\n")
+        for iteration_number in sorted(blocks):
+            block = blocks[iteration_number]
+            for line in block:
+                handle.write(f"{line}\n")
+            handle.write("\n")
+
+
 def update_abundance_history_table(
     path: Path,
     iteration_id: int,
@@ -2669,28 +2717,70 @@ def update_abundance_history_table(
     rounded_abundances: np.ndarray,
     random_errors: np.ndarray,
 ) -> None:
-    """Update the cumulative wide-format elemental-abundance history."""
+    """Update the cumulative vertical elemental-abundance history."""
     path = Path(path)
     elements = list(species.element_names)
-    if path.exists() and path.stat().st_size > 0:
+    abundances = np.asarray(abundances, dtype=float)
+    rounded_abundances = np.asarray(rounded_abundances, dtype=float)
+    random_errors = np.asarray(random_errors, dtype=float)
+
+    blocks = _read_vertical_history_blocks(path)
+
+    # Backward compatibility: if an existing history file is in the old wide
+    # format, convert all of its stored iterations to vertical blocks first.
+    if path.exists() and path.stat().st_size > 0 and not blocks:
         try:
-            table = pd.read_csv(path, delim_whitespace=True, comment="#")
+            old_table = pd.read_csv(path, sep=r"\s+", comment="#")
+            if "Element" in old_table.columns:
+                old_table = old_table.set_index("Element").reindex(elements)
+                iteration_numbers = sorted({
+                    int(column.split("_")[1])
+                    for column in old_table.columns
+                    if column.startswith("Iteration_")
+                    and column.endswith("_Abundance")
+                    and "_Rounded_" not in column
+                })
+                for old_iteration in iteration_numbers:
+                    prefix = f"Iteration_{old_iteration}"
+                    block = [
+                        f"Iteration {old_iteration}",
+                        "Element   Abundance   Rounded_Abundance   Random_Error",
+                    ]
+                    for element in elements:
+                        abundance = old_table.at[element, f"{prefix}_Abundance"]
+                        rounded = old_table.at[element, f"{prefix}_Rounded_Abundance"]
+                        error = old_table.at[element, f"{prefix}_Random_Error"]
+                        block.append(
+                            f"{element:<7}   {_format_history_float(abundance):>9}   "
+                            f"{_format_history_float(rounded):>17}   "
+                            f"{_format_history_float(error):>12}"
+                        )
+                    blocks[old_iteration] = block
         except Exception:
-            table = pd.DataFrame({"Element": elements})
-    else:
-        table = pd.DataFrame({"Element": elements})
-    if "Element" not in table.columns:
-        table.insert(0, "Element", elements)
-    table = table.set_index("Element").reindex(elements)
-    prefix = f"Iteration_{iteration_id}"
-    table[f"{prefix}_Abundance"] = np.asarray(abundances, dtype=float)
-    table[f"{prefix}_Rounded_Abundance"] = np.asarray(rounded_abundances, dtype=float)
-    table[f"{prefix}_Random_Error"] = np.asarray(random_errors, dtype=float)
-    table = table.reset_index()
-    with open(path, "w") as handle:
-        handle.write("# Cumulative elemental-abundance history for GJ205\n")
-        handle.write("# Each iteration adds abundance, rounded abundance, and 1-sigma random-error columns.\n")
-        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
+            blocks = {}
+
+    block = [
+        f"Iteration {iteration_id}",
+        "Element   Abundance   Rounded_Abundance   Random_Error",
+    ]
+    for element, abundance, rounded, error in zip(
+        elements, abundances, rounded_abundances, random_errors
+    ):
+        block.append(
+            f"{element:<7}   {_format_history_float(abundance):>9}   "
+            f"{_format_history_float(rounded):>17}   "
+            f"{_format_history_float(error):>12}"
+        )
+    blocks[int(iteration_id)] = block
+
+    _write_vertical_history_blocks(
+        path,
+        [
+            "# Cumulative elemental-abundance history for GJ205",
+            "# Each iteration is listed below the previous iteration.",
+        ],
+        blocks,
+    )
 
 
 def update_parameter_history_table(
@@ -2701,7 +2791,7 @@ def update_parameter_history_table(
     parameter_errors: Dict[str, float],
     parameter_consistency_shifts: Dict[str, float],
 ) -> None:
-    """Update the cumulative wide-format atmospheric-parameter history."""
+    """Update the cumulative vertical atmospheric-parameter history."""
     path = Path(path)
     rows = [
         ("Teff", "teff", stellar_parameters.teff),
@@ -2711,26 +2801,76 @@ def update_parameter_history_table(
         ("vmic", "vmic", stellar_parameters.vmic),
     ]
     labels = [r[0] for r in rows]
-    if path.exists() and path.stat().st_size > 0:
+
+    blocks = _read_vertical_history_blocks(path)
+
+    # Backward compatibility: convert an existing old wide-format parameter
+    # history to vertical blocks before adding/replacing the current iteration.
+    if path.exists() and path.stat().st_size > 0 and not blocks:
         try:
-            table = pd.read_csv(path, delim_whitespace=True, comment="#")
+            old_table = pd.read_csv(path, sep=r"\s+", comment="#")
+            if "Parameter" in old_table.columns:
+                old_table = old_table.set_index("Parameter").reindex(labels)
+                iteration_numbers = sorted({
+                    int(column.split("_")[1])
+                    for column in old_table.columns
+                    if column.startswith("Iteration_")
+                    and column.endswith("_Real_Value")
+                })
+                for old_iteration in iteration_numbers:
+                    prefix = f"Iteration_{old_iteration}"
+                    block = [
+                        f"Iteration {old_iteration}",
+                        "Parameter   Real_Value   Rounded_Value   Random_Error   Pass1_to_Pass2_Difference",
+                    ]
+                    for label in labels:
+                        real_value = old_table.at[label, f"{prefix}_Real_Value"]
+                        rounded_value = old_table.at[label, f"{prefix}_Rounded_Value"]
+                        error = old_table.at[label, f"{prefix}_Random_Error"]
+                        difference = old_table.at[label, f"{prefix}_Pass1_to_Pass2_Difference"]
+                        block.append(
+                            f"{label:<12}   {_format_history_float(real_value):>10}   "
+                            f"{_format_history_float(rounded_value):>13}   "
+                            f"{_format_history_float(error):>12}   "
+                            f"{_format_history_float(difference):>25}"
+                        )
+                    blocks[old_iteration] = block
         except Exception:
-            table = pd.DataFrame({"Parameter": labels})
-    else:
-        table = pd.DataFrame({"Parameter": labels})
-    if "Parameter" not in table.columns:
-        table.insert(0, "Parameter", labels)
-    table = table.set_index("Parameter").reindex(labels)
-    prefix = f"Iteration_{iteration_id}"
-    table[f"{prefix}_Real_Value"] = [real_parameter_values.get(r[1], np.nan) for r in rows]
-    table[f"{prefix}_Rounded_Value"] = [float(r[2]) for r in rows]
-    table[f"{prefix}_Random_Error"] = [parameter_errors.get(r[1], np.nan) for r in rows]
-    table[f"{prefix}_Pass1_to_Pass2_Difference"] = [parameter_consistency_shifts.get(r[1], np.nan) for r in rows]
-    table = table.reset_index()
-    with open(path, "w") as handle:
-        handle.write("# Cumulative atmospheric-parameter history for GJ205\n")
-        handle.write("# Each iteration adds accepted real value, propagated rounded value, 1-sigma random error, and Pass-1/Pass-2 consistency difference.\n")
-        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
+            blocks = {}
+
+    block = [
+        f"Iteration {iteration_id}",
+        "Parameter   Real_Value   Rounded_Value   Random_Error   Pass1_to_Pass2_Difference",
+    ]
+    for label, key, rounded_value in rows:
+        block.append(
+            f"{label:<12}   {_format_history_float(real_parameter_values.get(key, np.nan)):>10}   "
+            f"{_format_history_float(float(rounded_value)):>13}   "
+            f"{_format_history_float(parameter_errors.get(key, np.nan)):>12}   "
+            f"{_format_history_float(parameter_consistency_shifts.get(key, np.nan)):>25}"
+        )
+    blocks[int(iteration_id)] = block
+
+    _write_vertical_history_blocks(
+        path,
+        [
+            "# Cumulative atmospheric-parameter history for GJ205",
+            "# Each iteration is listed below the previous iteration.",
+            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and Pass-1/Pass-2 consistency difference.",
+        ],
+        blocks,
+    )
+
+
+def _format_history_float(value: float) -> str:
+    """Format one history-table value while preserving NaN entries."""
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return "nan"
+    if not np.isfinite(numeric_value):
+        return "nan"
+    return f"{numeric_value:.6f}"
 
 
 def rebuild_history_outputs_from_restart(
