@@ -458,9 +458,8 @@ class AutoSpecFitConfig:
     #
     # Iterations 9-15:
     #     convergence is accepted when all species satisfy <= 0.05 dex, or when
-    #     at most two species remain above 0.05 dex, provided that:
-    #       (1) one of them may exceed 0.05 dex without an upper limit; and
-    #       (2) the second, if present, must be > 0.05 dex and <= 0.10 dex.
+    #     at most two species remain above 0.05 dex, provided that no more than
+    #     one of those species has a successive abundance difference > 0.10 dex.
     #     Any species above 0.05 dex is treated as non-converged/oscillating and
     #     its final abundance is estimated from the median of its final three
     #     finite iteration abundances.
@@ -547,10 +546,12 @@ class AutoSpecFitConfig:
     second_pass_teff_half_width: float = 50.0
     second_pass_alpha_half_width: float = 0.10
 
-    # Cumulative vertical history tables. The legacy row-style parameter history is kept
-    # for restart compatibility with older runs produced by this example setup.
+    # Cumulative user-facing history tables are written vertically. The legacy
+    # row-style parameter-history filename is retained ONLY so older checkpoints
+    # can be migrated; new runs do not append to that legacy file.
     abundance_history_file: str = "ASF_Abundance_History_GJ205.txt"
     parameter_history_file: str = "ASF_Parameter_History_GJ205.txt"
+    convergence_history_file: str = "ASF_Convergence_History_GJ205.txt"
     legacy_parameter_history_file: str = "ASF_Stellar_Parameter_History_GJ205.txt"
 
     # ------------------------------------------------------------------
@@ -836,7 +837,7 @@ def write_iteration_chi2_table(
     output_path = Path(output_dir) / config.current_abundance_chi2_file
     with open(output_path, "w") as handle:
         handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
-        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
 
 def write_iteration_abundance_error_table(
@@ -856,7 +857,7 @@ def write_iteration_abundance_error_table(
     output_path = Path(output_dir) / config.current_abundance_line_error_file
     with open(output_path, "w") as handle:
         handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
-        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
 
 def write_species_mean_table(
@@ -875,7 +876,7 @@ def write_species_mean_table(
     })
     with open(output_path, "w") as handle:
         handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
-        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
 
 def convert_asf_offsets_to_xh(
@@ -925,6 +926,7 @@ def write_final_abundance_table(
     per_parameter_systematics: Optional[Dict[str, np.ndarray]] = None,
     systematic_errors: Optional[np.ndarray] = None,
     total_errors: Optional[np.ndarray] = None,
+    convergence_summary: Optional[List[str]] = None,
 ) -> None:
     """Save final [X/H] abundances with random, systematic, and total errors.
 
@@ -1004,11 +1006,15 @@ def write_final_abundance_table(
             "# Final_Systematic_Error is the quadrature sum of the five per-parameter systematic columns.\n"
             "# Total error = sqrt(Random_Error^2 + Systematic_Error^2)\n"
         )
-        table.to_csv(handle, sep=" ", index=False, header=True, float_format="%.6f", na_rep="nan")
+        if convergence_summary:
+            handle.write("#\n# Iterative convergence summary\n")
+            for line in convergence_summary:
+                handle.write(f"# {line}\n")
+        table.to_csv(handle, sep=" ", index=False, header=True, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
     if nan_replacement_notes:
         with open(output_path, "a") as handle:
-            handle.write("\n# NaN abundance replacements used during follow-up model generation\n")
+            handle.write("\n# Iterative abundance replacement/finalization notes\n")
             for note in nan_replacement_notes:
                 handle.write(f"# {note}\n")
 
@@ -2145,9 +2151,8 @@ def evaluate_convergence_status(
         At most one species may remain above 0.05 dex.
 
     Iterations 9-15
-        At most two species may remain above 0.05 dex. One of these may have
-        any change above 0.05 dex (no upper limit), while the second, if
-        present, must have 0.05 < |Delta abundance| <= 0.10 dex.
+        At most two species may remain above 0.05 dex, and no more than one
+        of those species may have |Delta abundance| > 0.10 dex.
 
     Any species above 0.05 dex is returned in ``non_converged_indices`` so that
     the late-history median treatment can be applied at finalization.
@@ -2267,12 +2272,12 @@ def apply_late_history_statistics(
             final_not_rounded[species_index] = adopted_value
             final_rounded[species_index] = np.round(adopted_value, 3)
 
-            late_values_text = ", ".join(f"{value:+.3f}" for value in late_values)
+            late_values_text = ", ".join(f"{_normalize_negative_zero(value, 3):+.3f}" for value in late_values)
             note = (
                 f"Iteration {iteration_id}: {element_name} {context}; final "
                 f"{element_name} abundance set to the median of the final "
                 f"{len(late_values)} finite iteration values "
-                f"({late_values_text}; median = {adopted_value:+.3f})."
+                f"({late_values_text}; median = {_normalize_negative_zero(adopted_value, 3):+.3f})."
             )
         else:
             note = (
@@ -2782,6 +2787,7 @@ def update_abundance_history_table(
         [
             "# Cumulative elemental-abundance history for GJ205",
             "# Each iteration is listed below the previous iteration.",
+            "# After iterative convergence/finalization, one additional dedicated final-abundance iteration may be listed; no parameter refinement follows it.",
         ],
         blocks,
     )
@@ -2866,16 +2872,135 @@ def update_parameter_history_table(
     )
 
 
-def _format_history_float(value: float) -> str:
-    """Format one history-table value while preserving NaN entries."""
+def _normalize_negative_zero(value: float, decimals: int) -> float:
+    """Return +0.0 when a finite value would otherwise print as negative zero."""
+    numeric_value = float(value)
+    if np.isfinite(numeric_value):
+        half_unit = 0.5 * (10.0 ** (-int(decimals)))
+        if abs(numeric_value) < half_unit:
+            numeric_value = 0.0
+    return numeric_value
+
+
+def _format_output_float(value: float, decimals: int = 6) -> str:
+    """Format one finite output value without producing strings such as -0.000000."""
     try:
         numeric_value = float(value)
     except (TypeError, ValueError):
         return "nan"
     if not np.isfinite(numeric_value):
         return "nan"
-    return f"{numeric_value:.6f}"
+    numeric_value = _normalize_negative_zero(numeric_value, decimals)
+    return f"{numeric_value:.{int(decimals)}f}"
 
+
+def _format_history_float(value: float) -> str:
+    """Format one history-table value while preserving NaN and avoiding negative zero."""
+    return _format_output_float(value, 6)
+
+
+
+def _abundance_convergence_rule_text(iteration_id: int, config: AutoSpecFitConfig) -> str:
+    """Return a concise human-readable abundance-convergence rule for one iteration."""
+    if iteration_id < config.intermediate_convergence_start_iteration:
+        return "all elements must have |Delta abundance| <= 0.05 dex"
+    if iteration_id < config.late_convergence_start_iteration:
+        return "at most one element may have |Delta abundance| > 0.05 dex"
+    return (
+        "at most two elements may have |Delta abundance| > 0.05 dex, "
+        "and no more than one may exceed 0.10 dex"
+    )
+
+
+def update_convergence_history_table(
+    path: Path,
+    iteration_id: int,
+    species: SpeciesConfig,
+    previous_abundances: np.ndarray,
+    current_abundances: np.ndarray,
+    abundance_changes: np.ndarray,
+    abundance_criterion_satisfied: bool,
+    parameter_criterion_satisfied: bool,
+    overall_criterion_satisfied: bool,
+    convergence_mode: str,
+    decision: str,
+    config: AutoSpecFitConfig,
+) -> None:
+    """Write one vertical convergence-status block for the current iterative cycle."""
+    path = Path(path)
+    previous_abundances = np.asarray(previous_abundances, dtype=float)
+    current_abundances = np.asarray(current_abundances, dtype=float)
+    abundance_changes = np.asarray(abundance_changes, dtype=float)
+
+    blocks = _read_vertical_history_blocks(path)
+    n_above_005 = int(np.sum((~np.isfinite(abundance_changes)) | (abundance_changes > 0.05)))
+    n_above_010 = int(np.sum(np.isfinite(abundance_changes) & (abundance_changes > 0.10)))
+
+    parameter_thresholds = (
+        f"Teff <= {config.teff_convergence_tolerance:.0f} K; "
+        f"logg <= {config.logg_convergence_tolerance:.2f} dex; "
+        f"[M/H] <= {config.metallicity_convergence_tolerance:.2f} dex; "
+    )
+    if hasattr(config, "alpha_convergence_tolerance"):
+        parameter_thresholds += f"[alpha/Fe] <= {config.alpha_convergence_tolerance:.2f} dex; "
+    parameter_thresholds += f"vmic < {config.vmic_convergence_tolerance:.2f} km/s"
+
+    block = [
+        f"Iteration {iteration_id}",
+        f"Abundance_Rule: {_abundance_convergence_rule_text(iteration_id, config)}",
+        f"Abundance_Criterion_Satisfied: {'YES' if abundance_criterion_satisfied else 'NO'}",
+        f"Parameter_Criterion_Satisfied: {'YES' if parameter_criterion_satisfied else 'NO'}",
+        f"Overall_Convergence_Criterion_Satisfied: {'YES' if overall_criterion_satisfied else 'NO'}",
+        f"Convergence_Mode: {convergence_mode}",
+        f"Decision: {decision}",
+        f"N_Elements_Above_0.05_dex: {n_above_005}",
+        f"N_Elements_Above_0.10_dex: {n_above_010}",
+        f"Parameter_Thresholds: {parameter_thresholds}",
+        "Element   Previous_Abundance   Current_Abundance   Abs_Change   Within_0.05_dex",
+    ]
+    for element, previous, current, delta in zip(
+        species.element_names, previous_abundances, current_abundances, abundance_changes
+    ):
+        within = bool(np.isfinite(delta) and delta <= 0.05)
+        block.append(
+            f"{element:<7}   {_format_history_float(previous):>18}   "
+            f"{_format_history_float(current):>17}   "
+            f"{_format_history_float(delta):>10}   "
+            f"{'YES' if within else 'NO'}"
+        )
+
+    blocks[int(iteration_id)] = block
+    _write_vertical_history_blocks(
+        path,
+        [
+            "# Cumulative convergence history for GJ205",
+            "# Each iterative cycle is listed vertically below the previous cycle.",
+            "# Overall convergence is satisfied only when BOTH abundance and atmospheric-parameter criteria are satisfied.",
+            "# Maximum-iteration finalization is explicitly reported and is NOT labeled as convergence.",
+        ],
+        blocks,
+    )
+
+
+def _convergence_summary_lines(
+    iteration_id: int,
+    abundance_criterion_satisfied: bool,
+    parameter_criterion_satisfied: bool,
+    overall_criterion_satisfied: bool,
+    convergence_mode: str,
+    decision: str,
+    config: AutoSpecFitConfig,
+) -> List[str]:
+    """Return comment-ready lines summarizing the final iterative convergence decision."""
+    return [
+        f"Iterative cycles completed: {iteration_id}",
+        f"Abundance convergence criterion: {'SATISFIED' if abundance_criterion_satisfied else 'NOT SATISFIED'}",
+        f"Atmospheric-parameter convergence criterion: {'SATISFIED' if parameter_criterion_satisfied else 'NOT SATISFIED'}",
+        f"Overall convergence criterion (both required): {'SATISFIED' if overall_criterion_satisfied else 'NOT SATISFIED'}",
+        f"Convergence mode: {convergence_mode}",
+        f"Finalization decision: {decision}",
+        f"Abundance rule at final iterative cycle: {_abundance_convergence_rule_text(iteration_id, config)}",
+    ]
 
 def rebuild_history_outputs_from_restart(
     config: AutoSpecFitConfig,
@@ -3366,8 +3491,9 @@ def assert_canonical_stellar_parameter_strings(
 def format_abundance_filename_value(value: float) -> str:
     """Canonical abundance string used in every TS/model filename: signed 3 decimals."""
     value = float(value)
-    if abs(value) < 5.0e-7:
-        value = 0.0
+    # Any value that rounds to zero at three decimal places must be written as
+    # +0.000 rather than -0.000, because the string is also used in filenames.
+    value = _normalize_negative_zero(value, 3)
     return f"{value:+.3f}"
 
 
@@ -3784,7 +3910,7 @@ def write_current_parameter_table(
             f"# Stage: PARAMETER ITERATION\n# Iteration: {iteration_id}\n"
             f"# Parameter_Pass: {parameter_pass}\n# Completed_Step: {completed_step}\n"
         )
-        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
 
 def write_final_parameter_table(
@@ -3792,6 +3918,7 @@ def write_final_parameter_table(
     parameter_errors: Dict[str, float],
     real_parameter_values: Dict[str, float],
     config: AutoSpecFitConfig,
+    convergence_summary: Optional[List[str]] = None,
 ) -> None:
     """Write final stellar parameters with their random fitting errors only.
 
@@ -3829,8 +3956,12 @@ def write_final_parameter_table(
             "# Pass-1 to Pass-2 differences are consistency diagnostics only and\n"
             "# are not interpreted as systematic parameter uncertainties.\n"
         )
+        if convergence_summary:
+            handle.write("#\n# Iterative convergence summary\n")
+            for line in convergence_summary:
+                handle.write(f"# {line}\n")
         table.to_csv(
-            handle, sep=" ", index=False, float_format="%.6f", na_rep="nan"
+            handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan"
         )
     LOGGER.info("Wrote final stellar-parameter table: %s", output_path)
 
@@ -3958,7 +4089,7 @@ def evaluate_parameter_grid(
             f"# Parameter_Pass: {parameter_pass}\n# Parameter: {parameter_name}\n"
         )
         pd.DataFrame(curve_output).to_csv(
-            handle, sep=" ", index=False, float_format="%.8f", na_rep="nan"
+            handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 8), na_rep="nan"
         )
 
     # Save one row per diagnostic line with its independent parameter result.
@@ -3982,7 +4113,7 @@ def evaluate_parameter_grid(
             f"# Parameter_Pass: {parameter_pass}\n# Parameter: {parameter_name}\n"
         )
         result_table.to_csv(
-            handle, sep=" ", index=False, float_format="%.8f", na_rep="nan"
+            handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 8), na_rep="nan"
         )
 
     # Append the ensemble statistics as comments.
@@ -4986,8 +5117,14 @@ def run_autospecfit_abundance_pipeline(
         # A genuinely new run starts clean cumulative/legacy history and progress files.
         parameter_history_path = Path(config.output_dir) / config.parameter_history_file
         abundance_history_path = Path(config.output_dir) / config.abundance_history_file
+        convergence_history_path = Path(config.output_dir) / config.convergence_history_file
         legacy_parameter_history_path = Path(config.output_dir) / config.legacy_parameter_history_file
-        for history_path in (parameter_history_path, abundance_history_path, legacy_parameter_history_path):
+        for history_path in (
+            parameter_history_path,
+            abundance_history_path,
+            convergence_history_path,
+            legacy_parameter_history_path,
+        ):
             if history_path.exists():
                 history_path.unlink()
         clear_parameter_progress(config)
@@ -5022,6 +5159,7 @@ def run_autospecfit_abundance_pipeline(
 
     parameter_history_path = Path(config.output_dir) / config.parameter_history_file
     abundance_history_path = Path(config.output_dir) / config.abundance_history_file
+    convergence_history_path = Path(config.output_dir) / config.convergence_history_file
     legacy_parameter_history_path = Path(config.output_dir) / config.legacy_parameter_history_file
 
     if checkpoint is None:
@@ -5136,7 +5274,7 @@ def run_autospecfit_abundance_pipeline(
                                 note = (
                                     f"Iteration {iteration_id}: {element_name} abundance "
                                     f"from iteration {iteration_id - 1} is NaN; using "
-                                    f"{replacement_value:+.3f} from the most recent "
+                                    f"{_normalize_negative_zero(replacement_value, 3):+.3f} from the most recent "
                                     f"valid previous iteration to generate models."
                                 )
                             else:
@@ -5264,15 +5402,9 @@ def run_autospecfit_abundance_pipeline(
                     refinement.converged or change_converged
                 )
 
-                write_parameter_history_row(
-                    legacy_parameter_history_path,
-                    parameter_iteration_id,
-                    used_parameters,
-                    refinement.stellar_parameters,
-                    refinement.converged,
-                    change_converged,
-                    refinement.note,
-                )
+                # Do not write the old row-style parameter history. New runs use
+                # only the vertical parameter-history table below. The legacy file
+                # is retained solely as a read/migration source for older checkpoints.
 
                 # Every individual parameter sub-step is already rounded to
                 # its nearest adopted grid value. Apply one final grid-rounding
@@ -5372,7 +5504,7 @@ def run_autospecfit_abundance_pipeline(
                 )
 
                 (
-                    converged,
+                    abundance_criterion_satisfied,
                     non_converged_indices,
                     active_tolerance,
                     convergence_mode,
@@ -5382,34 +5514,67 @@ def run_autospecfit_abundance_pipeline(
                     config,
                 )
 
-                if (
-                    converged
-                    and config.refine_parameters_after_each_iteration
-                    and iteration_id < n_total_iterations
-                    and not parameter_converged_for_next_iteration
-                ):
-                    LOGGER.info(
-                        "Abundance convergence reached at iteration %d, but stellar "
-                        "parameters changed beyond tolerance; continuing with the "
-                        "refined atmosphere.",
-                        iteration_id,
-                    )
-                    converged = False
+                # Overall convergence ALWAYS requires both abundance and atmospheric-
+                # parameter stability. This remains true at the maximum iteration;
+                # reaching the iteration limit can trigger finalization, but it is not
+                # mislabeled as convergence when either criterion is still unsatisfied.
+                parameter_criterion_satisfied = (
+                    bool(parameter_converged_for_next_iteration)
+                    if config.refine_parameters_after_each_iteration
+                    else True
+                )
+                overall_criterion_satisfied = bool(
+                    abundance_criterion_satisfied and parameter_criterion_satisfied
+                )
 
                 reached_maximum_iteration = iteration_id == n_total_iterations
-                forced_final_iteration = False
+                forced_final_iteration = bool(
+                    reached_maximum_iteration and not overall_criterion_satisfied
+                )
+                finalize_now = bool(overall_criterion_satisfied or forced_final_iteration)
 
-                if not converged and reached_maximum_iteration:
-                    forced_final_iteration = True
-                    active_tolerance = config.late_convergence_tolerance
+                if forced_final_iteration:
                     convergence_mode = "maximum-iteration finalization"
+                    active_tolerance = config.late_convergence_tolerance
                     non_converged_indices = np.where(
                         (~np.isfinite(change))
                         | (change > active_tolerance)
                     )[0].astype(int).tolist()
-                    converged = True
+                    decision = (
+                        "FINALIZE AT MAXIMUM ITERATION WITHOUT FULL CONVERGENCE"
+                    )
+                elif overall_criterion_satisfied:
+                    decision = "CONVERGENCE ACCEPTED; FINALIZE"
+                else:
+                    decision = "CONTINUE TO NEXT ITERATION"
 
-                if converged:
+                update_convergence_history_table(
+                    path=convergence_history_path,
+                    iteration_id=iteration_id,
+                    species=species,
+                    previous_abundances=mean_history[:, iteration_id - 2],
+                    current_abundances=mean_history[:, iteration_id - 1],
+                    abundance_changes=change,
+                    abundance_criterion_satisfied=abundance_criterion_satisfied,
+                    parameter_criterion_satisfied=parameter_criterion_satisfied,
+                    overall_criterion_satisfied=overall_criterion_satisfied,
+                    convergence_mode=convergence_mode,
+                    decision=decision,
+                    config=config,
+                )
+
+                convergence_check_note = (
+                    f"Convergence check at iteration {iteration_id}: "
+                    f"abundance={'SATISFIED' if abundance_criterion_satisfied else 'NOT SATISFIED'}; "
+                    f"parameters={'SATISFIED' if parameter_criterion_satisfied else 'NOT SATISFIED'}; "
+                    f"overall={'SATISFIED' if overall_criterion_satisfied else 'NOT SATISFIED'}; "
+                    f"decision={decision}."
+                )
+                LOGGER.info(convergence_check_note)
+                log_handle.write(f"# {convergence_check_note}\n")
+                log_handle.flush()
+
+                if finalize_now:
                     final_not_rounded = mean_history[:, iteration_id - 1].copy()
                     final_rounded = rounded_history[:, iteration_id - 1].copy()
 
@@ -5441,24 +5606,39 @@ def run_autospecfit_abundance_pipeline(
 
                     if forced_final_iteration:
                         note = (
-                            f"Maximum iteration {iteration_id} reached before a "
-                            f"tiered convergence criterion was satisfied."
+                            f"Maximum iteration {iteration_id} reached before BOTH convergence "
+                            f"requirements were satisfied. Abundance criterion: "
+                            f"{'satisfied' if abundance_criterion_satisfied else 'not satisfied'}; "
+                            f"atmospheric-parameter criterion: "
+                            f"{'satisfied' if parameter_criterion_satisfied else 'not satisfied'}. "
+                            f"Finalization is performed because the configured iteration limit "
+                            f"was reached and is not counted as converged."
                         )
                     elif non_converged_indices:
                         note = (
-                            f"Convergence accepted at iteration {iteration_id} "
-                            f"under the {convergence_mode} criterion."
+                            f"Overall convergence accepted at iteration {iteration_id}: both "
+                            f"abundance and atmospheric-parameter criteria were satisfied under "
+                            f"the {convergence_mode} abundance rule."
                         )
                     else:
                         note = (
-                            f"Convergence accepted at iteration {iteration_id}: "
-                            f"all species satisfied the active tolerance."
+                            f"Overall convergence accepted at iteration {iteration_id}: both "
+                            f"abundance and atmospheric-parameter criteria were satisfied."
                         )
 
                     LOGGER.info(note)
                     log_handle.write(f"# {note}\n")
                     log_handle.flush()
-                    nan_replacement_notes.append(note)
+
+                    convergence_summary = _convergence_summary_lines(
+                        iteration_id=iteration_id,
+                        abundance_criterion_satisfied=abundance_criterion_satisfied,
+                        parameter_criterion_satisfied=parameter_criterion_satisfied,
+                        overall_criterion_satisfied=overall_criterion_satisfied,
+                        convergence_mode=convergence_mode,
+                        decision=decision,
+                        config=config,
+                    )
 
                     # Record final atmospheric parameters and their uncertainties.
                     write_final_parameter_table(
@@ -5466,6 +5646,7 @@ def run_autospecfit_abundance_pipeline(
                         parameter_errors=last_parameter_errors,
                         real_parameter_values=last_real_parameter_values,
                         config=config,
+                        convergence_summary=convergence_summary,
                     )
 
                     # ---------------------------------------------------------
@@ -5490,7 +5671,7 @@ def run_autospecfit_abundance_pipeline(
                                 )
                                 replacement_note = (
                                     f"Final abundance fit: {element_name} seed abundance is NaN; "
-                                    f"using {replacement_value:+.3f} from the most recent finite iterative abundance."
+                                    f"using {_normalize_negative_zero(replacement_value, 3):+.3f} from the most recent finite iterative abundance."
                                 )
                             else:
                                 final_seed_strings.append("+0.000")
@@ -5584,6 +5765,7 @@ def run_autospecfit_abundance_pipeline(
                         per_parameter_systematics=per_parameter_systematics,
                         systematic_errors=systematic_errors,
                         total_errors=total_abundance_errors,
+                        convergence_summary=convergence_summary,
                     )
                     save_restart_checkpoint(
                         config,
