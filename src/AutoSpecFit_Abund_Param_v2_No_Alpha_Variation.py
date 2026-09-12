@@ -448,11 +448,11 @@ class AutoSpecFitConfig:
     #
     # All abundance-convergence stages use the same 0.05 dex tolerance.
     #
-    # Iterations 2-6:
+    # Iterations 2-5:
     #     strict convergence is accepted only when all species change by
     #     <= 0.05 dex between consecutive iterations.
     #
-    # Iterations 7-8:
+    # Iterations 6-8:
     #     convergence is accepted when all species, or all but one species,
     #     change by <= 0.05 dex. If one species is still non-converged, its
     #     final abundance is set to the median of its final three finite
@@ -472,7 +472,7 @@ class AutoSpecFitConfig:
     early_convergence_tolerance: float = 0.05
     intermediate_convergence_tolerance: float = 0.05
     late_convergence_tolerance: float = 0.05
-    intermediate_convergence_start_iteration: int = 7
+    intermediate_convergence_start_iteration: int = 6
     late_convergence_start_iteration: int = 9
     final_statistics_window: int = 3
 
@@ -577,7 +577,7 @@ class AutoSpecFitConfig:
     teff_convergence_tolerance: float = 50.0
     logg_convergence_tolerance: float = 0.10
     metallicity_convergence_tolerance: float = 0.10
-    vmic_convergence_tolerance: float = 0.20  # convergence requires |Delta vmic| < 0.20 km/s
+    vmic_convergence_tolerance: float = 0.20  # convergence requires |Delta vmic| <= 0.20 km/s
 
     # ------------------------------------------------------------------
     # AutoSpecNorm and model-smoothing settings
@@ -2142,10 +2142,10 @@ def evaluate_convergence_status(
 
     Rules
     -----
-    Iterations 2-6
+    Iterations 2-5
         Every species must satisfy |Delta abundance| <= 0.05 dex.
 
-    Iterations 7-8
+    Iterations 6-8
         At most one species may remain above 0.05 dex.
 
     Iterations 9-15
@@ -2168,7 +2168,7 @@ def evaluate_convergence_status(
         (~finite) | (change > active_tolerance)
     )[0].astype(int).tolist()
 
-    # Iterations 2-6: all species must satisfy <= 0.05 dex.
+    # Iterations 2-5: all species must satisfy <= 0.05 dex.
     if iteration_id < config.intermediate_convergence_start_iteration:
         converged = len(non_converged_indices) == 0
         return (
@@ -2178,7 +2178,7 @@ def evaluate_convergence_status(
             "strict early convergence",
         )
 
-    # Iterations 7-8: allow only one species above 0.05 dex.
+    # Iterations 6-8: allow only one species above 0.05 dex.
     if iteration_id < config.late_convergence_start_iteration:
         converged = len(non_converged_indices) <= 1
         return (
@@ -2630,7 +2630,7 @@ def parameter_change_is_converged(
         d_teff <= config.teff_convergence_tolerance
         and d_logg <= config.logg_convergence_tolerance
         and d_metallicity <= config.metallicity_convergence_tolerance
-        and d_vmic < config.vmic_convergence_tolerance
+        and d_vmic <= (config.vmic_convergence_tolerance + 1.0e-10)
     )
 
 
@@ -2975,7 +2975,7 @@ def _parameter_convergence_details(
             ("[alpha/Fe]", "alpha", float(config.alpha_convergence_tolerance), "<=")
         )
     specifications.append(
-        ("vmic", "vmic", float(config.vmic_convergence_tolerance), "<")
+        ("vmic", "vmic", float(config.vmic_convergence_tolerance), "<=")
     )
 
     details: List[Tuple[str, float, float, float, str, bool]] = []
@@ -2984,7 +2984,7 @@ def _parameter_convergence_details(
         current = float(current_values.get(key, np.nan))
         if np.isfinite(previous) and np.isfinite(current):
             delta = abs(current - previous)
-            within = bool(delta <= tolerance) if operator == "<=" else bool(delta < tolerance)
+            within = bool(delta <= (tolerance + 1.0e-10)) if operator == "<=" else bool(delta < tolerance)
         else:
             delta = np.nan
             within = False

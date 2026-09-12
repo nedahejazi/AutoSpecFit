@@ -5,10 +5,11 @@ This revision keeps the defining v1.0 behavior: stellar atmospheric parameters a
 ## Main changes
 
 - Updated abundance convergence to match v2.0:
-  - iterations 2-6: all elements must have |Delta abundance| <= 0.05 dex;
-  - iterations 7-8: at most one element may exceed 0.05 dex;
+  - iterations 2-5: all elements must have |Delta abundance| <= 0.05 dex;
+  - iterations 6-8: at most one element may exceed 0.05 dex;
   - iterations 9-15: at most two may exceed 0.05 dex and no more than one may exceed 0.10 dex;
   - maximum 15 iterative abundance cycles.
+- Updated the v2.0 atmospheric-parameter convergence criterion for microturbulence: |Delta vmic| <= 0.20 km s^-1 (inclusive, with a small floating-point safety margin), instead of |Delta vmic| < 0.20 km s^-1. This permits a one-grid-step vmic change. ASF v1.0 is unaffected by this parameter rule because its atmospheric parameters, including vmic, are fixed.
 - Non-finite abundance changes are treated as non-converged/oscillating species rather than causing an ambiguous global failure.
 - Maximum-iteration finalization is explicitly labeled as a hard-stop result, not convergence.
 - Added one dedicated final abundance determination after iterative convergence/finalization, with the fixed v1.0 atmosphere and adopted iterative abundances used as non-target seeds.
