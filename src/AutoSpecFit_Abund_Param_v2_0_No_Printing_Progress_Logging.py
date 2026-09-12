@@ -57,9 +57,9 @@ any rotational-broadening treatment must therefore be handled consistently by
 the external synthesis/convolution setup if required.
 
 In this configuration, atmospheric-parameter and abundance iterations alternate
-to approach a self-consistent solution. Once the final atmospheric parameters are
-accepted, ASF performs one dedicated final abundance determination and does not
-refine the stellar parameters afterward.
+to approach a self-consistent solution. Once the adopted convergence/finalization
+criteria are satisfied, the abundances from the final iterative abundance step
+are retained as the final abundance solution.
 
 AutoSpecNorm
 ------------
@@ -420,7 +420,7 @@ class AutoSpecFitConfig:
     # over this grid, while the abundances of all other elements are fixed to
     # the species-level mean abundances determined in the previous iteration.
     #
-    # The default grid spans -0.360 to +0.360 dex in steps of 0.020 dex. Users may
+    # The default grid spans -0.400 to +0.400 dex in steps of 0.020 dex. Users may
     # freely modify both the abundance range and the grid spacing depending on
     # their scientific goals and computational resources.
     #
@@ -433,7 +433,7 @@ class AutoSpecFitConfig:
     #
     # Users should ensure that the abundance range is sufficiently broad so
     # that the chi-square minimum does not occur near the grid boundaries.
-    abundance_values: Tuple[float, ...] = tuple(np.round(np.arange(-0.360, 0.361, 0.020), 3))
+    abundance_values: Tuple[float, ...] = tuple(np.round(np.arange(-0.400, 0.401, 0.020), 3))
 
     # ------------------------------------------------------------------
     # Iteration and convergence settings
@@ -621,8 +621,8 @@ class AutoSpecFitConfig:
     # -0.250 < A(OH) < +0.250 dex.
     # For every other species, reject only line abundances equal to
     # -0.360, -0.350, +0.350, or +0.360 dex.
-    oh_lower_rejection_limit: float = -0.250
-    oh_upper_rejection_limit: float = +0.250
+    oh_lower_rejection_limit: float = -0.300
+    oh_upper_rejection_limit: float = +0.300
     generic_rejected_abundances: Tuple[float, ...] = (
         -0.360, -0.350, +0.350, +0.360
     )
@@ -934,7 +934,7 @@ def write_final_abundance_table(
     """Save final [X/H] abundances with random, systematic, and total errors.
 
     ``final_not_rounded`` and ``final_rounded`` are the native ASF abundance
-    offsets from the dedicated final abundance fit.  The science abundance
+    offsets from the final iterative abundance fit.  The science abundance
     reported here is converted to [X/H] with the final fitted [M/H] and, for
     alpha elements, the final fitted [alpha/Fe].  The native ASF offset is kept
     as a separate column for traceability.
@@ -2782,7 +2782,6 @@ def update_abundance_history_table(
         [
             "# Cumulative elemental-abundance history for GJ205",
             "# Each iteration is listed below the previous iteration.",
-            "# After iterative convergence/finalization, one additional dedicated final-abundance iteration may be listed; no parameter refinement follows it.",
         ],
         blocks,
     )
@@ -5426,9 +5425,7 @@ def run_autospecfit_abundance_pipeline(
                 )
 
                 # Abundance iteration N is followed by the refinement that
-                # produces parameter iteration N+1. If convergence is accepted,
-                # the dedicated final abundance is also iteration N+1 and no
-                # parameter refinement follows it.
+                # produces parameter iteration N+1.
                 if config.refine_parameters_after_each_iteration:
                     next_stage = "parameter"
                 else:
@@ -5728,92 +5725,6 @@ def run_autospecfit_abundance_pipeline(
                         real_parameter_values=last_real_parameter_values,
                         config=config,
                         convergence_summary=convergence_summary,
-                    )
-
-                    # ---------------------------------------------------------
-                    # DEDICATED FINAL ABUNDANCE DETERMINATION
-                    # ---------------------------------------------------------
-                    # Freeze the final stellar parameters above, then re-measure the
-                    # abundances once more. No parameter-refinement stage follows.
-                    final_seed_strings: List[str] = []
-                    for species_index, value in enumerate(final_rounded):
-                        element_name = species.element_names[species_index]
-                        if np.isfinite(value):
-                            final_seed_strings.append(
-                                format_abundance_filename_value(float(value))
-                            )
-                        else:
-                            earlier_values = rounded_history[species_index, :iteration_id]
-                            finite_earlier_values = earlier_values[np.isfinite(earlier_values)]
-                            if len(finite_earlier_values) > 0:
-                                replacement_value = float(finite_earlier_values[-1])
-                                final_seed_strings.append(
-                                    format_abundance_filename_value(replacement_value)
-                                )
-                                replacement_note = (
-                                    f"Final abundance fit: {element_name} seed abundance is NaN; "
-                                    f"using {_normalize_negative_zero(replacement_value, 3):+.3f} from the most recent finite iterative abundance."
-                                )
-                            else:
-                                final_seed_strings.append("+0.000")
-                                replacement_note = (
-                                    f"Final abundance fit: {element_name} seed abundance is NaN and no "
-                                    f"finite previous abundance exists; using +0.000."
-                                )
-                            LOGGER.warning(replacement_note)
-                            log_handle.write(f"# {replacement_note}\n")
-                            log_handle.flush()
-                            nan_replacement_notes.append(replacement_note)
-
-                    final_abundance_iteration_id = iteration_id + 1
-                    LOGGER.info(
-                        "Starting dedicated FINAL abundance determination with fixed stellar "
-                        "parameters after iterative cycle %d.", iteration_id,
-                    )
-                    final_model_paths = followup_iteration_model_paths(
-                        config=config,
-                        stellar_parameters=current_stellar_parameters,
-                        species=species,
-                        previous_abundance_strings=final_seed_strings,
-                    )
-                    final_turbospectrum_commands = followup_iteration_turbospectrum_commands(
-                        config=config,
-                        stellar_parameters=current_stellar_parameters,
-                        species=species,
-                        previous_abundance_strings=final_seed_strings,
-                    )
-                    final_results = run_iteration(
-                        iteration_id=final_abundance_iteration_id,
-                        model_paths=final_model_paths,
-                        stellar_parameters=current_stellar_parameters,
-                        species=species,
-                        line_lists=line_lists,
-                        lam_star=lam_star,
-                        flux_star=flux_star,
-                        err_flux_star=err_flux_star,
-                        config=config,
-                        abundance_grid=abundance_grid,
-                        turbospectrum_commands=final_turbospectrum_commands,
-                        log_handle=log_handle,
-                    )
-                    final_not_rounded = np.asarray(
-                        [result.mean_abundance for result in final_results], dtype=float
-                    )
-                    final_rounded = np.asarray(
-                        [result.rounded_mean_abundance for result in final_results], dtype=float
-                    )
-                    current_abundance_errors = species_abundance_errors_from_iteration(final_results)
-                    update_abundance_history_table(
-                        path=abundance_history_path,
-                        iteration_id=final_abundance_iteration_id,
-                        species=species,
-                        abundances=final_not_rounded,
-                        rounded_abundances=final_rounded,
-                        random_errors=current_abundance_errors,
-                    )
-                    LOGGER.info(
-                        "Dedicated final abundance determination complete. No further "
-                        "stellar-parameter refinement will be performed."
                     )
 
                     # Propagate each atmospheric-parameter uncertainty into the
