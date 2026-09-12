@@ -2908,8 +2908,94 @@ def _abundance_convergence_rule_text(iteration_id: int, config: AutoSpecFitConfi
     )
 
 
+
+def _read_parameter_history_rounded_values(
+    path: Path,
+    iteration_id: int,
+) -> Dict[str, float]:
+    """Return propagated rounded atmospheric parameters for one history iteration.
+
+    The cumulative parameter-history file is written in vertical blocks.  Parameter
+    iteration N contains the atmosphere used by abundance iteration N.  Therefore,
+    during the convergence check after abundance iteration N, parameter iterations N
+    and N+1 provide the before/after values needed to assess atmospheric-parameter
+    convergence.  Reading the values back from the history file also makes this
+    diagnostic robust when a run resumes directly at the convergence stage.
+    """
+    path = Path(path)
+    blocks = _read_vertical_history_blocks(path)
+    block = blocks.get(int(iteration_id), [])
+    if not block:
+        return {}
+
+    label_to_key = {
+        "Teff": "teff",
+        "logg": "logg",
+        "[M/H]": "metallicity",
+        "[alpha/Fe]": "alpha",
+        "vmic": "vmic",
+    }
+    values: Dict[str, float] = {}
+    for line in block:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        key = label_to_key.get(parts[0])
+        if key is None:
+            continue
+        try:
+            values[key] = float(parts[2])
+        except (TypeError, ValueError):
+            values[key] = np.nan
+    return values
+
+
+def _parameter_convergence_details(
+    parameter_history_path: Path,
+    iteration_id: int,
+    config: AutoSpecFitConfig,
+) -> List[Tuple[str, float, float, float, str, bool]]:
+    """Return before/after parameter changes for one abundance-cycle convergence check."""
+    previous_values = _read_parameter_history_rounded_values(
+        parameter_history_path,
+        iteration_id,
+    )
+    current_values = _read_parameter_history_rounded_values(
+        parameter_history_path,
+        iteration_id + 1,
+    )
+
+    specifications: List[Tuple[str, str, float, str]] = [
+        ("Teff", "teff", float(config.teff_convergence_tolerance), "<="),
+        ("logg", "logg", float(config.logg_convergence_tolerance), "<="),
+        ("[M/H]", "metallicity", float(config.metallicity_convergence_tolerance), "<="),
+    ]
+    if hasattr(config, "alpha_convergence_tolerance"):
+        specifications.append(
+            ("[alpha/Fe]", "alpha", float(config.alpha_convergence_tolerance), "<=")
+        )
+    specifications.append(
+        ("vmic", "vmic", float(config.vmic_convergence_tolerance), "<")
+    )
+
+    details: List[Tuple[str, float, float, float, str, bool]] = []
+    for label, key, tolerance, operator in specifications:
+        previous = float(previous_values.get(key, np.nan))
+        current = float(current_values.get(key, np.nan))
+        if np.isfinite(previous) and np.isfinite(current):
+            delta = abs(current - previous)
+            within = bool(delta <= tolerance) if operator == "<=" else bool(delta < tolerance)
+        else:
+            delta = np.nan
+            within = False
+        threshold_text = f"{operator} {tolerance:g}"
+        details.append((label, previous, current, delta, threshold_text, within))
+    return details
+
+
 def update_convergence_history_table(
     path: Path,
+    parameter_history_path: Path,
     iteration_id: int,
     species: SpeciesConfig,
     previous_abundances: np.ndarray,
@@ -2922,7 +3008,14 @@ def update_convergence_history_table(
     decision: str,
     config: AutoSpecFitConfig,
 ) -> None:
-    """Write one vertical convergence-status block for the current iterative cycle."""
+    """Update one combined abundance+parameter convergence-history file.
+
+    One vertical block is written for every completed convergence check.  Each block
+    records the abundance changes, atmospheric-parameter changes, the active criteria,
+    and the resulting continue/finalize decision.  The file is rewritten cumulatively
+    so a repeated/restarted check for the same iteration replaces that iteration's
+    block instead of creating a duplicate.
+    """
     path = Path(path)
     previous_abundances = np.asarray(previous_abundances, dtype=float)
     current_abundances = np.asarray(current_abundances, dtype=float)
@@ -2932,14 +3025,11 @@ def update_convergence_history_table(
     n_above_005 = int(np.sum((~np.isfinite(abundance_changes)) | (abundance_changes > 0.05)))
     n_above_010 = int(np.sum(np.isfinite(abundance_changes) & (abundance_changes > 0.10)))
 
-    parameter_thresholds = (
-        f"Teff <= {config.teff_convergence_tolerance:.0f} K; "
-        f"logg <= {config.logg_convergence_tolerance:.2f} dex; "
-        f"[M/H] <= {config.metallicity_convergence_tolerance:.2f} dex; "
+    parameter_details = _parameter_convergence_details(
+        parameter_history_path=parameter_history_path,
+        iteration_id=iteration_id,
+        config=config,
     )
-    if hasattr(config, "alpha_convergence_tolerance"):
-        parameter_thresholds += f"[alpha/Fe] <= {config.alpha_convergence_tolerance:.2f} dex; "
-    parameter_thresholds += f"vmic < {config.vmic_convergence_tolerance:.2f} km/s"
 
     block = [
         f"Iteration {iteration_id}",
@@ -2951,7 +3041,8 @@ def update_convergence_history_table(
         f"Decision: {decision}",
         f"N_Elements_Above_0.05_dex: {n_above_005}",
         f"N_Elements_Above_0.10_dex: {n_above_010}",
-        f"Parameter_Thresholds: {parameter_thresholds}",
+        "",
+        "ABUNDANCE CONVERGENCE",
         "Element   Previous_Abundance   Current_Abundance   Abs_Change   Within_0.05_dex",
     ]
     for element, previous, current, delta in zip(
@@ -2965,12 +3056,38 @@ def update_convergence_history_table(
             f"{'YES' if within else 'NO'}"
         )
 
+    block.extend([
+        "",
+        f"ATMOSPHERIC-PARAMETER CONVERGENCE "
+        f"(parameter iterations {iteration_id} -> {iteration_id + 1})",
+        "Parameter   Previous_Value   Current_Value   Abs_Change   Required_Change   Within_Tolerance",
+    ])
+    for label, previous, current, delta, threshold_text, within in parameter_details:
+        block.append(
+            f"{label:<11}   {_format_history_float(previous):>14}   "
+            f"{_format_history_float(current):>13}   "
+            f"{_format_history_float(delta):>10}   "
+            f"{threshold_text:>15}   "
+            f"{'YES' if within else 'NO'}"
+        )
+
+    if not parameter_details or all(
+        not (np.isfinite(row[1]) and np.isfinite(row[2])) for row in parameter_details
+    ):
+        block.append(
+            "Parameter-change details unavailable from the cumulative parameter history; "
+            "the stored parameter criterion above is retained."
+        )
+
     blocks[int(iteration_id)] = block
     _write_vertical_history_blocks(
         path,
         [
-            "# Cumulative convergence history for GJ205",
-            "# Each iterative cycle is listed vertically below the previous cycle.",
+            "# Cumulative combined convergence history for GJ205",
+            "# Each completed iterative convergence check is listed vertically below the previous check.",
+            "# Each block contains BOTH elemental-abundance and atmospheric-parameter changes.",
+            "# Parameter iteration N is the atmosphere used by abundance iteration N; therefore the",
+            "# parameter convergence check after abundance iteration N compares parameter iterations N and N+1.",
             "# Overall convergence is satisfied only when BOTH abundance and atmospheric-parameter criteria are satisfied.",
             "# Maximum-iteration finalization is explicitly reported and is NOT labeled as convergence.",
         ],
@@ -5597,6 +5714,7 @@ def run_autospecfit_abundance_pipeline(
 
                 update_convergence_history_table(
                     path=convergence_history_path,
+                    parameter_history_path=parameter_history_path,
                     iteration_id=iteration_id,
                     species=species,
                     previous_abundances=mean_history[:, iteration_id - 2],

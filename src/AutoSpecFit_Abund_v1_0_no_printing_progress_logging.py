@@ -175,6 +175,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import logging
 import time
 import os
+import json
 import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d
@@ -194,6 +195,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOGGER = logging.getLogger(__name__)
+# Quiet version: suppress AutoSpecFit Python logger output in the terminal.
+LOGGER.disabled = True
 
 
 # -----------------------------------------------------------------------------
@@ -243,13 +246,13 @@ class SpeciesConfig:
     """
 
     element_codes: Tuple[str, ...] = (
-        "x08", "x12", "x13", "x19", "x20", "x22", "x24", "x25", "x26"
+        "x08", "x12", "x13", "x19", "x20", "x22", "x25", "x26"
     )
     element_names: Tuple[str, ...] = (
-        "O", "Mg", "Al", "K", "Ca", "Ti", "Cr", "Mn", "Fe"
+        "O", "Mg", "Al", "K", "Ca", "Ti", "Mn", "Fe"
     )
     species_names: Tuple[str, ...] = (
-        "OH", "Mg", "Al", "K", "Ca", "Ti", "Cr", "Mn", "Fe"
+        "OH", "Mg", "Al", "K", "Ca", "Ti", "Mn", "Fe"
     )
 
     def __post_init__(self) -> None:
@@ -310,39 +313,17 @@ class AutoSpecFitConfig:
     # Output files
     # ------------------------------------------------------------------
 
-    # Human-readable line-by-line abundance log.
-    #
-    # Columns:
-    #     LineCenter
-    #     BestFit_Abundance_PolyFit
-    #     BestFit_Abundance_Original
-    #
-    # This file is updated immediately after each line is fitted, allowing
-    # users to monitor progress during long ASF runs.
-    iteration_log_file: str = "ASF_LineByLine_Abundance_Iterations_GJ205.txt"
+    # Rolling progress files: overwritten with the newest completed abundance iteration.
+    current_abundance_summary_file: str = "ASF_Current_Abundance_Results_GJ205.txt"
+    current_abundance_chi2_file: str = "ASF_Current_Abundance_Chi2_GJ205.txt"
+    current_abundance_line_error_file: str = "ASF_Current_Abundance_Line_Errors_GJ205.txt"
+    iteration_log_file: str = "ASF_Run_Notes_GJ205.txt"
 
-    # Final elemental abundance table written after convergence or after the
-    # last requested iteration.
-    #
-    # Columns:
-    #     Element
-    #     Final_Abundance
-    #     Abundance_Error
-    #     Final_Abundance_Not_Rounded
-    #
-    # The abundance error is calculated from the line-by-line chi-square
-    # uncertainties of the same final or converged iteration.
+    # Cumulative/final science outputs.
+    abundance_history_file: str = "ASF_Abundance_History_GJ205.txt"
+    convergence_history_file: str = "ASF_Convergence_History_GJ205.txt"
+    fixed_parameter_file: str = "ASF_Fixed_Stellar_Parameters_GJ205.txt"
     final_abundance_file: str = "ASF_Final_Elemental_Abundances_GJ205.txt"
-
-    # Prefix for iteration-level species abundance summaries.
-    #
-    # Example outputs:
-    #     ASF_Species_Mean_Abundances_Iteration_1.txt
-    #     ASF_Species_Mean_Abundances_Iteration_2.txt
-    #
-    # Each file records the abundance adopted for every species in that
-    # iteration after line rejection, sigma clipping, and weighting.
-    mean_abundance_prefix: str = "ASF_Species_Mean_Abundances_Iteration_GJ205_"
 
     # ------------------------------------------------------------------
     # Turbospectrum model naming and execution
@@ -368,7 +349,8 @@ class AutoSpecFitConfig:
 
     # User-supplied bash script used to execute Turbospectrum and generate
     # the synthetic spectra required by ASF.
-    turbospectrum_runner: Optional[str] = "./run_TS_Interpolated_Model_H_band.sh"
+    turbospectrum_runner: Optional[str] = "./run_TS_Interpolated_Model_H_band_apogee.sh"
+    turbospectrum_noninterpolated_runner: Optional[str] = "./run_TS_NonInterpolated_Model_H_band_apogee.sh"
 
     # Optional execution prefix used on HPC systems. The default reproduces
     # the original ASF workflow using SLURM and GNU parallel. Depending on the
@@ -379,8 +361,8 @@ class AutoSpecFitConfig:
 
     # Waiting behavior after Turbospectrum jobs are submitted.
     wait_for_models: bool = True
-    max_model_wait_checks: int = 150
-    model_wait_seconds: float = 0.5 * 3600
+    max_model_wait_checks: int = 300
+    model_wait_seconds: float = 0.25 * 3600
 
     # ------------------------------------------------------------------
     # Wavelength and abundance-grid settings
@@ -397,7 +379,7 @@ class AutoSpecFitConfig:
     # over this grid, while the abundances of all other elements are fixed to
     # the species-level mean abundances determined in the previous iteration.
     #
-    # The default grid spans -0.35 to +0.35 dex in steps of 0.01 dex. Users may
+    # The default grid spans -0.360 to +0.360 dex in steps of 0.020 dex. Users may
     # freely modify both the abundance range and the grid spacing depending on
     # their scientific goals and computational resources.
     #
@@ -410,7 +392,7 @@ class AutoSpecFitConfig:
     #
     # Users should ensure that the abundance range is sufficiently broad so
     # that the chi-square minimum does not occur near the grid boundaries.
-    abundance_values: Tuple[float, ...] = tuple(np.round(np.arange(-0.35, 0.351, 0.01), 3))
+    abundance_values: Tuple[float, ...] = tuple(np.round(np.arange(-0.360, 0.361, 0.020), 3))
 
     # ------------------------------------------------------------------
     # Iteration and convergence settings
@@ -418,9 +400,9 @@ class AutoSpecFitConfig:
 
     # The first abundance iteration is run separately. This value gives the
     # number of additional iterations after iteration 1. The default value of
-    # 11 gives a maximum of 12 total abundance iterations, limiting the
+    # 14 gives a maximum of 15 total abundance iterations, limiting the
     # computational load on shared HPC systems.
-    n_followup_iterations: int = 11
+    n_followup_iterations: int = 14
 
     # Tiered convergence settings used by ASF.
     #
@@ -434,19 +416,27 @@ class AutoSpecFitConfig:
     #     still non-converged, its final abundance is set to the median of its
     #     final three finite iteration abundances.
     #
-    # Iterations 9-12:
-    #     convergence is evaluated in the same way as iterations 7-8, but using
-    #     late_convergence_tolerance.
+    # Iterations 9-15:
+    #     convergence is accepted when at most two species exceed 0.05 dex,
+    #     provided that no more than one of them exceeds 0.10 dex.
     #
     # At the maximum iteration, if no convergence condition has been met, ASF
     # writes the final table using the last iteration for converged species and
     # the median of the final three finite iterations for non-converged species.
-    early_convergence_tolerance: float = 0.03
-    intermediate_convergence_tolerance: float = 0.04
+    early_convergence_tolerance: float = 0.05
+    intermediate_convergence_tolerance: float = 0.05
     late_convergence_tolerance: float = 0.05
     intermediate_convergence_start_iteration: int = 7
     late_convergence_start_iteration: int = 9
     final_statistics_window: int = 3
+
+    # Elements that receive the fixed input [alpha/Fe] term when ASF offsets are converted to [X/H].
+    alpha_elements: Tuple[str, ...] = ("O", "Mg", "Ca", "Ti")
+
+    # Restart/checkpoint support, consistent with the v2 workflow.
+    resume_from_checkpoint: bool = True
+    checkpoint_file: str = "ASF_v1_Restart_Checkpoint_GJ205.txt"
+    fresh_start_marker_file: str = "ASF_v1_Fresh_Start_Initialized_GJ205.txt"
 
 
     # ------------------------------------------------------------------
@@ -485,16 +475,17 @@ class AutoSpecFitConfig:
     # parabolic fitting and chi2_min + 1 uncertainty estimation.
     parabolic_fit_half_width: float = 0.10
 
-    # Abundance-grid edge rejection limits. OH lines use a more restrictive
-    # lower limit because their abundance measurements can become less reliable
-    # near the lower boundary of the tested grid.
-    oh_lower_rejection_limit: float = -0.23
-    generic_lower_rejection_limit: float = -0.34
-    upper_rejection_limit: float = 0.34
+    # Abundance rejection limits, matched to the current v2 abundance workflow.
+    # OH line abundances are accepted only when -0.250 < A(OH) < +0.250 dex.
+    # For every other species, reject only the four edge/near-edge values below.
+    oh_lower_rejection_limit: float = -0.250
+    oh_upper_rejection_limit: float = +0.250
+    generic_rejected_abundances: Tuple[float, ...] = (-0.360, -0.350, +0.350, +0.360)
+    abundance_edge_tolerance: float = 1.0e-8
 
     def abundance_strings(self) -> List[str]:
         """Return abundance values formatted with explicit signs for filenames."""
-        return [f"{value:+.3f}" for value in self.abundance_values]
+        return [format_abundance_filename_value(value) for value in self.abundance_values]
 
 @dataclass
 class LineList:
@@ -687,15 +678,10 @@ def write_iteration_chi2_table(
     abundances: np.ndarray,
     line_results: List[LineFitResult],
     output_dir: Path,
+    config: AutoSpecFitConfig,
 ) -> None:
-    """Save chi-square curves for all fitted lines in one iteration.
-
-    The output has one row per tested abundance and one column per spectral
-    line. Example columns are: abundance, OH_1, OH_2, Mg_1, Fe_1.
-    Failed or skipped abundance points are written as NaN.
-    """
+    """Overwrite the rolling abundance chi-square table with the newest iteration."""
     if not line_results:
-        LOGGER.warning("No chi-square curves were saved for iteration %s.", iteration_id)
         return
 
     chi2_columns = [result.chi2_curve for result in line_results]
@@ -704,118 +690,175 @@ def write_iteration_chi2_table(
         np.column_stack([abundances, *chi2_columns]),
         columns=["abundance", *line_labels],
     )
-
-    output_path = Path(output_dir) / f"Chi2_Iteration_{iteration_id}.txt"
-    table.to_csv(output_path, sep=" ", index=False, float_format="%.6f", na_rep="nan")
-    LOGGER.info("Wrote chi-square table: %s", output_path)
+    output_path = Path(output_dir) / config.current_abundance_chi2_file
+    with open(output_path, "w") as handle:
+        handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
+        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
 
 def write_iteration_abundance_error_table(
     iteration_id: int,
     line_results: List[LineFitResult],
     output_dir: Path,
+    config: AutoSpecFitConfig,
 ) -> None:
-    """Save line-by-line abundance uncertainties for one iteration.
-
-    Uncertainties are estimated from local parabolic fits to chi-square as a
-    function of abundance using the criterion chi2 = chi2_min + 1.
-    """
+    """Overwrite the rolling line-error table with the newest abundance iteration."""
     if not line_results:
-        LOGGER.warning("No abundance errors were saved for iteration %s.", iteration_id)
         return
 
     table = pd.DataFrame(
         [[result.abundance_error for result in line_results]],
         columns=[result.label for result in line_results],
     )
-    output_path = Path(output_dir) / f"Abundance_Errors_Iteration_{iteration_id}.txt"
-    table.to_csv(output_path, sep=" ", index=False, float_format="%.6f", na_rep="nan")
-    LOGGER.info("Wrote abundance-error table: %s", output_path)
+    output_path = Path(output_dir) / config.current_abundance_line_error_file
+    with open(output_path, "w") as handle:
+        handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
+        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
 
 def write_species_mean_table(
     iteration_id: int,
     species: SpeciesConfig,
     mean_abundances: np.ndarray,
+    random_errors: np.ndarray,
     config: AutoSpecFitConfig,
 ) -> None:
-    """Save species-level mean abundances for one iteration.
+    """Overwrite the rolling species summary with the newest abundance results."""
+    output_path = Path(config.output_dir) / config.current_abundance_summary_file
+    table = pd.DataFrame({
+        "Element": species.element_names,
+        "Abundance": mean_abundances,
+        "Random_Error": random_errors,
+    })
+    with open(output_path, "w") as handle:
+        handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
+        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
 
-    The abundances written here are the iteration-level values used as fixed
-    abundances for the next ASF iteration.
-    """
-    output_path = Path(config.output_dir) / f"{config.mean_abundance_prefix}{iteration_id}.txt"
-    table = pd.DataFrame(
-        {
-            "element": species.element_names,
-            "mean_abundance": mean_abundances,
-        }
-    )
-    table.to_csv(output_path, sep=" ", index=False, header=False, float_format="%.6f")
-    LOGGER.info("Wrote species mean-abundance table: %s", output_path)
 
 
 def write_final_abundance_table(
     final_not_rounded: np.ndarray,
     final_rounded: np.ndarray,
     final_errors: np.ndarray,
+    stellar_parameters: StellarParameters,
     species: SpeciesConfig,
     config: AutoSpecFitConfig,
     nan_replacement_notes: Optional[List[str]] = None,
+    convergence_summary: Optional[List[str]] = None,
 ) -> None:
-    """Save the final elemental abundance table.
-
-    The table is written after convergence, or after the maximum requested
-    number of iterations if formal convergence is not reached.
-
-    The abundance errors are derived from the line-by-line chi-square
-    uncertainties of the same iteration used for the final abundance solution.
-    If NaN abundance values were replaced during model generation, the
-    replacement history is appended as commented lines at the end of the file.
-    """
+    """Write final ASF offsets, physical [X/H] abundances, and random errors."""
     output_path = Path(config.output_dir) / config.final_abundance_file
-    table = pd.DataFrame(
-        {
-            "Element": species.element_names,
-            "Final_Abundance": final_rounded,
-            "Abundance_Error": final_errors,
-            "Final_Abundance_Not_Rounded": final_not_rounded,
-        }
-    )
-    table.to_csv(output_path, sep=" ", index=False, header=True, float_format="%.6f")
-
+    final_xh = convert_asf_offsets_to_xh(final_not_rounded, stellar_parameters, species, config)
+    table = pd.DataFrame({
+        "Element": species.element_names,
+        "ASF_Offset": np.asarray(final_rounded, dtype=float),
+        "Final_X_H": np.round(final_xh, 3),
+        "Final_Random_Error": np.asarray(final_errors, dtype=float),
+        "ASF_Offset_Not_Rounded": np.asarray(final_not_rounded, dtype=float),
+    })
+    with open(output_path, "w") as handle:
+        handle.write("# Final ASF v1.0 elemental abundances and 1-sigma random uncertainties (dex)\n")
+        handle.write(
+            f"# Fixed atmosphere: Teff={stellar_parameters.teff}, logg={stellar_parameters.logg}, "
+            f"[M/H]={stellar_parameters.metallicity}, [alpha/Fe]={stellar_parameters.alpha}, vmic={stellar_parameters.vmic}\n"
+        )
+        handle.write("# Non-alpha: [X/H] = ASF_Offset + [M/H]_input\n")
+        handle.write("# Alpha:     [X/H] = ASF_Offset + [M/H]_input + [alpha/Fe]_input\n")
+        handle.write("# Final_Random_Error combines line scatter and chi-square curvature for N>=2 accepted lines; N=1 uses chi-square error only.\n")
+        handle.write("# Atmospheric-parameter systematic uncertainties are not computed in v1.0 because the atmosphere is fixed.\n")
+        if convergence_summary:
+            handle.write("#\n# Iterative convergence summary\n")
+            for line in convergence_summary:
+                handle.write(f"# {line}\n")
+        table.to_csv(handle, sep=" ", index=False, header=True, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
     if nan_replacement_notes:
         with open(output_path, "a") as handle:
-            handle.write("\n# NaN abundance replacements used during follow-up model generation\n")
+            handle.write("\n# Iterative abundance replacement/finalization notes\n")
             for note in nan_replacement_notes:
                 handle.write(f"# {note}\n")
-
     LOGGER.info("Wrote final abundance table: %s", output_path)
 
 
 def species_abundance_errors_from_iteration(
     species_results: List[SpeciesIterationResult],
 ) -> np.ndarray:
-    """Return one abundance error per species for the current iteration.
+    """Return one random abundance uncertainty per species.
 
-    Each line-level abundance error is obtained from the local chi-square
-    parabola using chi2 = chi2_min + 1. The species-level value written to the
-    final abundance file is the median of the finite line-level errors from
-    the same iteration used for the final abundance solution.
+    Each individual line receives a formal 1-sigma uncertainty from the local
+    chi-square parabola using ``chi2 = chi2_min + 1``.  For a species with two
+    or more accepted lines, the random abundance uncertainty combines:
+
+        (1) the line-to-line sample standard deviation of the accepted
+            grid-based line abundances; and
+        (2) the RMS of the finite individual-line chi-square uncertainties
+            associated with accepted abundance solutions.
+
+    These terms are added in quadrature.  For a species represented by only
+    one accepted line, the random uncertainty is the formal chi-square error
+    of that line.  If no finite formal error is available for a one-line
+    species, the returned uncertainty is NaN rather than inventing an error.
     """
     species_errors: List[float] = []
 
     for result in species_results:
-        line_errors = np.asarray(
-            [line.abundance_error for line in result.line_results],
-            dtype=float,
-        )
-        finite_errors = line_errors[np.isfinite(line_errors)]
+        accepted = np.asarray(result.clipped_line_abundances, dtype=float)
+        accepted = accepted[np.isfinite(accepted)]
 
-        if len(finite_errors) == 0:
+        if len(accepted) == 0:
             species_errors.append(np.nan)
+            continue
+
+        # Match accepted abundance values back to individual line results.
+        # A used-index mask preserves multiplicity when two lines have the same
+        # sampled best abundance.
+        line_values = np.asarray(
+            [line.best_abundance_grid for line in result.line_results], dtype=float
+        )
+        line_errors = np.asarray(
+            [line.abundance_error for line in result.line_results], dtype=float
+        )
+        used = np.zeros(len(line_values), dtype=bool)
+        accepted_errors: List[float] = []
+
+        for abundance in accepted:
+            candidates = np.where(
+                (~used)
+                & np.isfinite(line_values)
+                & np.isclose(line_values, abundance, atol=1.0e-10, rtol=0.0)
+            )[0]
+            if len(candidates) == 0:
+                continue
+            idx = int(candidates[0])
+            used[idx] = True
+            if np.isfinite(line_errors[idx]) and line_errors[idx] > 0:
+                accepted_errors.append(float(line_errors[idx]))
+
+        finite_errors = np.asarray(accepted_errors, dtype=float)
+
+        # One accepted line: only the formal chi-square error is defined.
+        if len(accepted) == 1:
+            species_errors.append(
+                float(finite_errors[0]) if len(finite_errors) == 1 else np.nan
+            )
+            continue
+
+        line_scatter = float(np.std(accepted, ddof=1))
+        chi2_rms = (
+            float(np.sqrt(np.mean(finite_errors**2)))
+            if len(finite_errors) > 0
+            else np.nan
+        )
+
+        if np.isfinite(line_scatter) and np.isfinite(chi2_rms):
+            random_error = float(np.sqrt(line_scatter**2 + chi2_rms**2))
+        elif np.isfinite(line_scatter):
+            random_error = line_scatter
+        elif np.isfinite(chi2_rms):
+            random_error = chi2_rms
         else:
-            species_errors.append(float(np.nanmedian(finite_errors)))
+            random_error = np.nan
+
+        species_errors.append(random_error)
 
     return np.asarray(species_errors, dtype=float)
 
@@ -834,13 +877,292 @@ def append_nan_replacement_notes_to_mean_file(
     if not notes:
         return
 
-    output_path = Path(config.output_dir) / f"{config.mean_abundance_prefix}{iteration_id}.txt"
+    output_path = Path(config.output_dir) / config.current_abundance_summary_file
 
     with open(output_path, "a") as handle:
         handle.write("\n# NaN abundance replacements used for the next iteration\n")
         for note in notes:
             handle.write(f"# {note}\n")
 
+
+
+def _normalize_negative_zero(value: float, decimals: int) -> float:
+    """Return +0.0 when a finite value would otherwise print as negative zero."""
+    numeric_value = float(value)
+    if np.isfinite(numeric_value):
+        half_unit = 0.5 * (10.0 ** (-int(decimals)))
+        if abs(numeric_value) < half_unit:
+            numeric_value = 0.0
+    return numeric_value
+
+
+def _format_output_float(value: float, decimals: int = 6) -> str:
+    """Format a finite value while avoiding strings such as -0.000000."""
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return "nan"
+    if not np.isfinite(numeric_value):
+        return "nan"
+    numeric_value = _normalize_negative_zero(numeric_value, decimals)
+    return f"{numeric_value:.{int(decimals)}f}"
+
+
+def _format_history_float(value: float) -> str:
+    return _format_output_float(value, 6)
+
+
+def format_abundance_filename_value(value: float) -> str:
+    """Format a 3-decimal abundance filename value without negative zero."""
+    value = _normalize_negative_zero(float(value), 3)
+    return f"{value:+.3f}"
+
+
+def _read_vertical_history_blocks(path: Path) -> Dict[int, List[str]]:
+    """Read iteration blocks from an ASF vertical history file."""
+    path = Path(path)
+    blocks: Dict[int, List[str]] = {}
+    if not path.exists() or path.stat().st_size == 0:
+        return blocks
+    current_iteration = None
+    current_lines: List[str] = []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Iteration "):
+            if current_iteration is not None:
+                blocks[current_iteration] = current_lines
+            try:
+                current_iteration = int(stripped.split()[1])
+            except (IndexError, ValueError):
+                current_iteration = None
+            current_lines = [line] if current_iteration is not None else []
+        elif current_iteration is not None:
+            current_lines.append(line)
+    if current_iteration is not None:
+        blocks[current_iteration] = current_lines
+    return blocks
+
+
+def _write_vertical_history_blocks(path: Path, header_lines: List[str], blocks: Dict[int, List[str]]) -> None:
+    path = Path(path)
+    with open(path, "w") as handle:
+        for line in header_lines:
+            handle.write(f"{line}\n")
+        handle.write("\n")
+        for iteration_number in sorted(blocks):
+            for line in blocks[iteration_number]:
+                handle.write(f"{line}\n")
+            handle.write("\n")
+
+
+def update_abundance_history_table(
+    path: Path,
+    iteration_id: int,
+    species: SpeciesConfig,
+    abundances: np.ndarray,
+    rounded_abundances: np.ndarray,
+    random_errors: np.ndarray,
+    final_iteration: bool = False,
+) -> None:
+    """Update the cumulative vertical elemental-abundance history."""
+    blocks = _read_vertical_history_blocks(path)
+    block = [
+        f"Iteration {iteration_id}",
+        f"Stage {'DEDICATED_FINAL_ABUNDANCE' if final_iteration else 'ITERATIVE_ABUNDANCE'}",
+        "Element   Abundance   Rounded_Abundance   Random_Error",
+    ]
+    for element, abundance, rounded, error in zip(
+        species.element_names, abundances, rounded_abundances, random_errors
+    ):
+        block.append(
+            f"{element:<7}   {_format_history_float(abundance):>9}   "
+            f"{_format_history_float(rounded):>17}   {_format_history_float(error):>12}"
+        )
+    blocks[int(iteration_id)] = block
+    _write_vertical_history_blocks(
+        Path(path),
+        [
+            "# Cumulative elemental-abundance history for ASF v1.0",
+            "# Stellar atmospheric parameters are fixed throughout Version 1.0.",
+            "# Each completed abundance iteration is listed below the previous iteration.",
+            "# A dedicated final-abundance iteration is written after convergence/finalization.",
+        ],
+        blocks,
+    )
+
+
+def _abundance_convergence_rule_text(iteration_id: int, config: AutoSpecFitConfig) -> str:
+    if iteration_id < config.intermediate_convergence_start_iteration:
+        return "all elements must have |Delta abundance| <= 0.05 dex"
+    if iteration_id < config.late_convergence_start_iteration:
+        return "at most one element may have |Delta abundance| > 0.05 dex"
+    return (
+        "at most two elements may have |Delta abundance| > 0.05 dex, "
+        "and no more than one may exceed 0.10 dex"
+    )
+
+
+def update_convergence_history_table(
+    path: Path,
+    iteration_id: int,
+    species: SpeciesConfig,
+    previous_abundances: np.ndarray,
+    current_abundances: np.ndarray,
+    change: np.ndarray,
+    abundance_criterion_satisfied: bool,
+    convergence_mode: str,
+    reached_maximum_iteration: bool,
+    decision: str,
+    config: AutoSpecFitConfig,
+) -> None:
+    """Update one cumulative convergence file for the abundance-only v1.0 workflow."""
+    blocks = _read_vertical_history_blocks(path)
+    block = [
+        f"Iteration {iteration_id}",
+        f"Abundance_Criterion_Satisfied: {'YES' if abundance_criterion_satisfied else 'NO'}",
+        "Atmospheric_Parameter_Refinement: NOT_PERFORMED_IN_V1.0",
+        f"Overall_Convergence_Criterion_Satisfied: {'YES' if abundance_criterion_satisfied else 'NO'}",
+        f"Maximum_Iteration_Reached: {'YES' if reached_maximum_iteration else 'NO'}",
+        f"Decision: {decision}",
+        f"Abundance_Rule: {_abundance_convergence_rule_text(iteration_id, config)}",
+        f"Convergence_Mode: {convergence_mode}",
+        "",
+        "ABUNDANCE CONVERGENCE",
+        "Element   Previous_Abundance   Current_Abundance   Abs_Change   Above_0.05   Above_0.10",
+    ]
+    for element, previous, current, delta in zip(
+        species.element_names, previous_abundances, current_abundances, change
+    ):
+        above005 = (not np.isfinite(delta)) or delta > 0.05
+        above010 = np.isfinite(delta) and delta > 0.10
+        block.append(
+            f"{element:<7}   {_format_history_float(previous):>18}   "
+            f"{_format_history_float(current):>17}   {_format_history_float(delta):>10}   "
+            f"{'YES' if above005 else 'NO':>10}   {'YES' if above010 else 'NO':>10}"
+        )
+    block.extend([
+        "",
+        "ATMOSPHERIC PARAMETERS",
+        "Teff, logg, [M/H], [alpha/Fe], and vmic remain fixed at the user-supplied v1.0 values.",
+    ])
+    blocks[int(iteration_id)] = block
+    _write_vertical_history_blocks(
+        Path(path),
+        [
+            "# Cumulative ASF v1.0 convergence history",
+            "# Version 1.0 determines abundances only; atmospheric parameters are fixed and are not a convergence criterion.",
+        ],
+        blocks,
+    )
+
+
+def write_fixed_parameter_table(path: Path, stellar_parameters: StellarParameters) -> None:
+    """Write the fixed atmosphere used throughout an ASF v1.0 run."""
+    rows = [
+        ("Teff", stellar_parameters.teff),
+        ("logg", stellar_parameters.logg),
+        ("[M/H]", stellar_parameters.metallicity),
+        ("[alpha/Fe]", stellar_parameters.alpha),
+        ("vmic", stellar_parameters.vmic),
+    ]
+    with open(path, "w") as handle:
+        handle.write("# Fixed stellar atmospheric parameters used by ASF v1.0\n")
+        handle.write("# These quantities are not refined during the abundance iterations.\n")
+        handle.write("Parameter Value\n")
+        for label, value in rows:
+            handle.write(f"{label} {value}\n")
+
+
+def convert_asf_offsets_to_xh(
+    asf_abundances: np.ndarray,
+    stellar_parameters: StellarParameters,
+    species: SpeciesConfig,
+    config: AutoSpecFitConfig,
+) -> np.ndarray:
+    """Convert native ASF offsets to [X/H] using the fixed input atmosphere."""
+    asf = np.asarray(asf_abundances, dtype=float)
+    xh = asf + float(stellar_parameters.metallicity)
+    alpha_elements = set(config.alpha_elements)
+    for i, element_name in enumerate(species.element_names):
+        if element_name in alpha_elements and np.isfinite(xh[i]):
+            xh[i] += float(stellar_parameters.alpha)
+    return xh
+
+
+def _atomic_json_write(path: Path, payload: Dict) -> None:
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w") as handle:
+        json.dump(payload, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
+def save_restart_checkpoint(
+    config: AutoSpecFitConfig,
+    *,
+    next_stage: str,
+    iteration_id: int,
+    mean_history: np.ndarray,
+    rounded_history: np.ndarray,
+    abundance_errors: np.ndarray,
+    nan_replacement_notes: List[str],
+) -> None:
+    payload = {
+        "version": 1,
+        "next_stage": str(next_stage),
+        "iteration_id": int(iteration_id),
+        "mean_history": np.asarray(mean_history, dtype=float).tolist(),
+        "rounded_history": np.asarray(rounded_history, dtype=float).tolist(),
+        "abundance_errors": [None if not np.isfinite(v) else float(v) for v in np.asarray(abundance_errors, dtype=float)],
+        "nan_replacement_notes": list(nan_replacement_notes),
+    }
+    # JSON does not allow NaN in strict mode. Store non-finite history cells as null.
+    for key in ("mean_history", "rounded_history"):
+        payload[key] = [[None if not np.isfinite(v) else float(v) for v in row] for row in np.asarray(payload[key], dtype=float)]
+    _atomic_json_write(Path(config.output_dir) / config.checkpoint_file, payload)
+
+
+def initialize_fresh_start_once(config: AutoSpecFitConfig) -> None:
+    marker_path = Path(config.output_dir) / config.fresh_start_marker_file
+    if marker_path.exists():
+        return
+    checkpoint_path = Path(config.output_dir) / config.checkpoint_file
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+    with open(marker_path, "w") as handle:
+        handle.write("Fresh ASF v1.0 run initialized. Existing restart checkpoint was cleared.\n")
+
+
+def load_restart_checkpoint(config: AutoSpecFitConfig, species: SpeciesConfig, n_total_iterations: int) -> Optional[Dict]:
+    checkpoint_path = Path(config.output_dir) / config.checkpoint_file
+    if not config.resume_from_checkpoint or not checkpoint_path.exists():
+        return None
+    payload = json.loads(checkpoint_path.read_text())
+    if int(payload.get("version", 0)) != 1:
+        raise RuntimeError(f"Unsupported ASF v1.0 restart checkpoint version in {checkpoint_path}")
+    def arr(name):
+        raw = payload[name]
+        return np.asarray([[np.nan if v is None else float(v) for v in row] for row in raw], dtype=float)
+    mean_history = arr("mean_history")
+    rounded_history = arr("rounded_history")
+    expected_shape = (species.n_species, n_total_iterations)
+    if mean_history.shape != expected_shape or rounded_history.shape != expected_shape:
+        raise RuntimeError(
+            "Checkpoint history shape does not match current ASF v1.0 configuration: "
+            f"checkpoint={mean_history.shape}, expected={expected_shape}"
+        )
+    abundance_errors = np.asarray([np.nan if v is None else float(v) for v in payload.get("abundance_errors", [])], dtype=float)
+    return {
+        "next_stage": str(payload["next_stage"]),
+        "iteration_id": int(payload["iteration_id"]),
+        "mean_history": mean_history,
+        "rounded_history": rounded_history,
+        "abundance_errors": abundance_errors,
+        "nan_replacement_notes": list(payload.get("nan_replacement_notes", [])),
+    }
 
 # -----------------------------------------------------------------------------
 # Model filename and Turbospectrum helpers
@@ -1020,21 +1342,86 @@ def build_turbospectrum_parallel_string(
     return starting_str + middle_str_new + space_new + " " + abund_str_long
 
 
+def model_file_is_ready(path: Path) -> bool:
+    """Return True only when a model file exists and is non-empty."""
+    path = Path(path)
+    return path.exists() and path.stat().st_size > 0
+def missing_model_paths(model_paths: Iterable[Iterable[Path]]) -> List[Path]:
+    """Return required model paths that are absent or zero-byte."""
+    return [
+        Path(path)
+        for group in model_paths
+        for path in group
+        if not model_file_is_ready(Path(path))
+    ]
+def require_models_or_ts_enabled(
+    model_paths: Iterable[Iterable[Path]],
+    ts_enabled: bool,
+    stage_label: str,
+) -> List[Path]:
+    """Check required models and fail immediately if TS is disabled."""
+    missing = missing_model_paths(model_paths)
+    if missing and not ts_enabled:
+        preview = "\n".join(str(path) for path in missing[:10])
+        raise FileNotFoundError(
+            f"{stage_label}: {len(missing)} required synthetic model(s) are missing "
+            "or empty, but Turbospectrum generation is disabled.\n"
+            f"First missing files:\n{preview}"
+        )
+    return missing
+def prepare_model_for_generation(path: Path) -> bool:
+    """
+    Return True when a model must be generated.
+
+    Existing non-empty files are preserved and never submitted to Turbospectrum.
+    Zero-byte files are removed before submission because the external TS
+    workflow cannot safely overwrite an existing filename.
+    """
+    path = Path(path)
+    if model_file_is_ready(path):
+        return False
+    if path.exists() and path.stat().st_size == 0:
+        LOGGER.warning("Removing empty model file before TS submission: %s", path)
+        path.unlink()
+    return True
+
 def first_iteration_turbospectrum_commands(
     config: AutoSpecFitConfig,
     stellar_parameters: StellarParameters,
     species: SpeciesConfig,
 ) -> List[str]:
-    """Build one Turbospectrum command string per target species for iteration 1."""
+    """Build TS commands only for missing first-iteration abundance models."""
     abundance_strings = config.abundance_strings()
-    return [
-        build_turbospectrum_parallel_string(
-            stellar_parameters=stellar_parameters,
-            variable_element_code=element_code,
-            variable_abundance_strings=abundance_strings,
-        )
-        for element_code in species.element_codes
-    ]
+    commands: List[str] = []
+
+    for element_code in species.element_codes:
+        missing_abundances: List[str] = []
+        for abundance_string in abundance_strings:
+            filename = build_model_filename(
+                stellar_parameters,
+                {element_code: abundance_string},
+                config.model_extension,
+            )
+            path = Path(config.model_dir) / filename
+            if prepare_model_for_generation(path):
+                missing_abundances.append(abundance_string)
+
+        if missing_abundances:
+            commands.append(
+                build_turbospectrum_parallel_string(
+                    stellar_parameters=stellar_parameters,
+                    variable_element_code=element_code,
+                    variable_abundance_strings=missing_abundances,
+                )
+            )
+        else:
+            LOGGER.info(
+                "All first-iteration models already exist for element code %s; "
+                "no TS submission is needed.",
+                element_code,
+            )
+
+    return commands
 
 
 def followup_iteration_turbospectrum_commands(
@@ -1043,12 +1430,7 @@ def followup_iteration_turbospectrum_commands(
     species: SpeciesConfig,
     previous_abundance_strings: List[str],
 ) -> List[str]:
-    """Build one Turbospectrum command string per target species for iteration >= 2.
-
-    For the target species, the abundance is varied over the abundance grid.
-    All other species are fixed to the mean abundances inferred in the previous
-    ASF iteration.
-    """
+    """Build TS commands only for missing follow-up abundance models."""
     abundance_strings = config.abundance_strings()
     commands: List[str] = []
 
@@ -1058,23 +1440,45 @@ def followup_iteration_turbospectrum_commands(
             if idx != target_index:
                 fixed_abundances[element_code] = previous_abundance_strings[idx]
 
-        commands.append(
-            build_turbospectrum_parallel_string(
-                stellar_parameters=stellar_parameters,
-                variable_element_code=target_code,
-                variable_abundance_strings=abundance_strings,
-                fixed_element_abundances=fixed_abundances,
+        missing_abundances: List[str] = []
+        for trial_abundance in abundance_strings:
+            abundance_map = dict(fixed_abundances)
+            abundance_map[target_code] = trial_abundance
+            filename = build_model_filename(
+                stellar_parameters,
+                abundance_map,
+                config.model_extension,
             )
-        )
+            path = Path(config.model_dir) / filename
+            if prepare_model_for_generation(path):
+                missing_abundances.append(trial_abundance)
+
+        if missing_abundances:
+            commands.append(
+                build_turbospectrum_parallel_string(
+                    stellar_parameters=stellar_parameters,
+                    variable_element_code=target_code,
+                    variable_abundance_strings=missing_abundances,
+                    fixed_element_abundances=fixed_abundances,
+                )
+            )
+        else:
+            LOGGER.info(
+                "All follow-up models already exist for element code %s; "
+                "no TS submission is needed.",
+                target_code,
+            )
 
     return commands
 
 
 def wait_for_model_files(model_paths: Iterable[Iterable[Path]], config: AutoSpecFitConfig) -> None:
-    """Wait until all expected synthetic spectra exist on disk.
+    """Wait until all expected synthetic spectra exist and are non-empty.
 
-    This function allows ASF to pause after submitting Turbospectrum jobs and
-    continue automatically once all required spectra have been generated.
+    A filename may appear before Turbospectrum has finished writing the model.
+    Therefore a file is considered ready only when it exists and its size is
+    greater than zero bytes. Empty files remain in the waiting list and are
+    checked again on the next polling cycle.
     """
     if not config.wait_for_models:
         return
@@ -1082,13 +1486,16 @@ def wait_for_model_files(model_paths: Iterable[Iterable[Path]], config: AutoSpec
     flat_paths = [Path(path) for species_paths in model_paths for path in species_paths]
 
     for check_number in range(1, config.max_model_wait_checks + 1):
-        missing = [path for path in flat_paths if not path.exists()]
+        missing = [
+            path for path in flat_paths
+            if (not path.exists()) or path.stat().st_size == 0
+        ]
         if not missing:
             LOGGER.info("All %d synthetic spectra are available.", len(flat_paths))
             return
 
         LOGGER.info(
-            "Waiting for synthetic spectra: %d missing files at check %d/%d.",
+            "Waiting for synthetic spectra: %d missing or empty files at check %d/%d.",
             len(missing),
             check_number,
             config.max_model_wait_checks,
@@ -1101,6 +1508,45 @@ def wait_for_model_files(model_paths: Iterable[Iterable[Path]], config: AutoSpec
         f"First missing files:\n{missing_preview}"
     )
 
+
+def is_noninterpolated_atmosphere(stellar_parameters: StellarParameters) -> bool:
+    """
+    Return True only for MARCS atmosphere combinations available directly
+    without interpolation under the atmosphere-grid rule adopted by the user.
+    """
+    try:
+        teff = float(stellar_parameters.teff)
+        logg = float(stellar_parameters.logg)
+        metallicity = float(stellar_parameters.metallicity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Teff, logg, and metallicity must be numeric to select the TS runner."
+        ) from exc
+
+    native_teff = (3500.0, 3600.0, 3700.0, 3800.0, 3900.0)
+    native_logg = (4.5, 5.0, 5.5)
+
+    return (
+        any(np.isclose(teff, value, atol=1.0e-8, rtol=0.0) for value in native_teff)
+        and np.isclose(metallicity, 0.0, atol=1.0e-8, rtol=0.0)
+        and any(np.isclose(logg, value, atol=1.0e-8, rtol=0.0) for value in native_logg)
+    )
+def select_turbospectrum_runner(
+    stellar_parameters: StellarParameters,
+    config: AutoSpecFitConfig,
+) -> str:
+    """Select interpolated or non-interpolated TS bash script for one atmosphere."""
+    if is_noninterpolated_atmosphere(stellar_parameters):
+        if config.turbospectrum_noninterpolated_runner is None:
+            raise ValueError(
+                "A non-interpolated atmosphere was requested but "
+                "turbospectrum_noninterpolated_runner is not configured."
+            )
+        return config.turbospectrum_noninterpolated_runner
+
+    if config.turbospectrum_runner is None:
+        raise ValueError("Interpolated Turbospectrum runner is not configured.")
+    return config.turbospectrum_runner
 
 def run_turbospectrum_command(command: str, runner: str, execution_prefix: str = "") -> None:
     """Submit one external Turbospectrum synthesis command.
@@ -1217,6 +1663,9 @@ def compute_line_chi2_curve(
     flux_star: np.ndarray,
     err_flux_star: np.ndarray,
     config: AutoSpecFitConfig,
+    iteration_id: int,
+    element_name: str,
+    log_context: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute chi-square values for one line over the abundance grid.
 
@@ -1238,6 +1687,7 @@ def compute_line_chi2_curve(
 
     for abundance_index, model_path in enumerate(model_paths):
         abundance_value = float(abundances[abundance_index])
+
         try:
             lam_model, flux_model = read_model_spectrum(model_path, config.gaussian_sigma_pixels)
         except FileNotFoundError:
@@ -1278,6 +1728,7 @@ def compute_line_chi2_curve(
             config.autospecnorm_iteration_number,
         )
 
+
         # Reject cases where AutoSpecNorm could not identify usable continuum
         # points on both sides of the fitted line.
         has_left_point = np.any(lam_cut_work < line_center)
@@ -1305,6 +1756,23 @@ def compute_line_chi2_curve(
         chi2_curve[abundance_index] = chi2_value
         valid_abundances.append(abundances[abundance_index])
 
+        chi2_context = (
+            f"ABUNDANCE ITERATION {iteration_id}"
+            if log_context is None
+            else log_context
+        )
+        LOGGER.info(
+            "CHI2 | %s | ELEMENT %s | line %.3f | "
+            "grid %d/%d | abundance %+.3f | chi2=%.6e",
+            chi2_context,
+            element_name,
+            line_center,
+            abundance_index + 1,
+            len(abundances),
+            abundance_value,
+            chi2_value,
+        )
+
     return chi2_curve, np.asarray(valid_abundances, dtype=float)
 
 
@@ -1328,21 +1796,27 @@ def reject_edge_or_known_outlier_lines(
     species_index: int,
     config: AutoSpecFitConfig,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Remove lines whose best-fit abundance falls at problematic grid edges."""
+    """Apply the species-dependent abundance rejection rules."""
     valid = np.isfinite(line_abundances)
 
     if species_index == 0:
-        # OH has a known low-abundance tail in this use case, so a slightly
-        # higher lower bound is used.
+        # Preserve the established OH rejection interval.
         abundance_mask = (
             (line_abundances > config.oh_lower_rejection_limit)
-            & (line_abundances < config.upper_rejection_limit)
+            & (line_abundances < config.oh_upper_rejection_limit)
         )
     else:
-        abundance_mask = (
-            (line_abundances > config.generic_lower_rejection_limit)
-            & (line_abundances < config.upper_rejection_limit)
-        )
+        # For all other species, reject only:
+        # -0.360, -0.350, +0.350, +0.360 dex.
+        rejected = np.zeros_like(line_abundances, dtype=bool)
+        for rejected_value in config.generic_rejected_abundances:
+            rejected |= np.isclose(
+                line_abundances,
+                rejected_value,
+                atol=config.abundance_edge_tolerance,
+                rtol=0.0,
+            )
+        abundance_mask = ~rejected
 
     mask = valid & abundance_mask
     return line_abundances[mask], line_centers[mask]
@@ -1441,6 +1915,7 @@ def fit_species_in_iteration(
     config: AutoSpecFitConfig,
     abundance_grid: np.ndarray,
     log_handle=None,
+    log_context: Optional[str] = None,
 ) -> SpeciesIterationResult:
     """Fit all selected lines for one species in one iteration.
 
@@ -1469,6 +1944,9 @@ def fit_species_in_iteration(
             flux_star=flux_star,
             err_flux_star=err_flux_star,
             config=config,
+            iteration_id=iteration_id,
+            element_name=element_name,
+            log_context=log_context,
         )
 
         best_grid = best_grid_abundance(abundance_grid, chi2_curve)
@@ -1519,9 +1997,11 @@ def fit_species_in_iteration(
 
 
 
+
 def run_iteration(
     iteration_id: int,
     model_paths: List[List[Path]],
+    stellar_parameters: StellarParameters,
     species: SpeciesConfig,
     line_lists: List[LineList],
     lam_star: np.ndarray,
@@ -1532,91 +2012,53 @@ def run_iteration(
     turbospectrum_commands: Optional[List[str]] = None,
     log_handle=None,
 ) -> List[SpeciesIterationResult]:
-    """Run one complete ASF abundance iteration.
-
-    The iteration can optionally submit Turbospectrum jobs, wait for the
-    expected synthetic spectra, fit all selected lines for all species, write
-    diagnostic output files, and return the species-level abundance results.
-    """
+    """Run one complete abundance iteration with robust model/restart-friendly I/O."""
     run_ts_this_iteration = config.run_ts_by_iteration.get(iteration_id, config.run_turbospectrum)
-
+    missing_before_submission = require_models_or_ts_enabled(
+        model_paths, run_ts_this_iteration, f"Abundance iteration {iteration_id}"
+    )
     if run_ts_this_iteration:
-        if config.turbospectrum_runner is None:
-            raise ValueError(
-                "config.run_turbospectrum=True, but config.turbospectrum_runner is not defined."
+        if missing_before_submission:
+            LOGGER.info(
+                "Abundance iteration %d: %d required model(s) are missing or empty; submitting Turbospectrum for missing models.",
+                iteration_id, len(missing_before_submission),
             )
-        if not turbospectrum_commands:
-            raise ValueError(
-                "config.run_turbospectrum=True, but no Turbospectrum command strings were provided."
-            )
-
-        for command in turbospectrum_commands:
-            run_turbospectrum_command(
-                command=command,
-                runner=config.turbospectrum_runner,
-                execution_prefix=config.turbospectrum_execution_prefix,
-            )
+        runner = select_turbospectrum_runner(stellar_parameters, config)
+        if turbospectrum_commands:
+            LOGGER.info("Abundance iteration %d uses TS runner: %s", iteration_id, runner)
+            for command in turbospectrum_commands:
+                run_turbospectrum_command(command, runner, config.turbospectrum_execution_prefix)
+        else:
+            LOGGER.info("All required abundance models for iteration %d already exist; no Turbospectrum jobs are submitted.", iteration_id)
     else:
-        LOGGER.info(
-            "Skipping Turbospectrum launch for iteration %d; using existing synthetic spectra.",
-            iteration_id,
-        )
+        LOGGER.info("Skipping Turbospectrum launch for iteration %d; using existing synthetic spectra.", iteration_id)
 
     wait_for_model_files(model_paths, config)
-
     if log_handle is not None:
         if iteration_id > 1:
             log_handle.write("--------------------------------------\n")
-        log_handle.write(f"Iteration {iteration_id}\n")
-        log_handle.write("*******************\n\n")
+        log_handle.write(f"Iteration {iteration_id}\n*******************\n\n")
         log_handle.flush()
 
     species_results: List[SpeciesIterationResult] = []
     for species_index in range(species.n_species):
         result = fit_species_in_iteration(
-            iteration_id=iteration_id,
-            species_index=species_index,
-            species=species,
-            line_list=line_lists[species_index],
-            species_model_paths=model_paths[species_index],
-            lam_star=lam_star,
-            flux_star=flux_star,
-            err_flux_star=err_flux_star,
-            config=config,
-            abundance_grid=abundance_grid,
-            log_handle=log_handle,
+            iteration_id, species_index, species, line_lists[species_index],
+            model_paths[species_index], lam_star, flux_star, err_flux_star,
+            config, abundance_grid, log_handle,
         )
         species_results.append(result)
 
     all_line_results = [line for result in species_results for line in result.line_results]
-    write_iteration_chi2_table(iteration_id, abundance_grid, all_line_results, config.output_dir)
-    write_iteration_abundance_error_table(iteration_id, all_line_results, config.output_dir)
-
+    write_iteration_chi2_table(iteration_id, abundance_grid, all_line_results, config.output_dir, config)
+    write_iteration_abundance_error_table(iteration_id, all_line_results, config.output_dir, config)
     mean_abundances = np.asarray([result.rounded_mean_abundance for result in species_results], dtype=float)
-    write_species_mean_table(iteration_id, species, mean_abundances, config)
-
+    random_errors = species_abundance_errors_from_iteration(species_results)
+    write_species_mean_table(iteration_id, species, mean_abundances, random_errors, config)
     return species_results
 
 
-def convergence_rule_for_iteration(
-    iteration_id: int,
-    config: AutoSpecFitConfig,
-) -> Tuple[float, int, str]:
-    """Return the convergence tolerance and allowed non-converged species count.
 
-    The convergence rule becomes progressively more flexible with iteration
-    number. Early iterations require all species to converge tightly. Later
-    iterations allow one species to remain non-converged, in which case that
-    species is treated as oscillating and its final abundance is estimated
-    from its late-iteration history.
-    """
-    if iteration_id < config.intermediate_convergence_start_iteration:
-        return config.early_convergence_tolerance, 0, "strict early convergence"
-
-    if iteration_id < config.late_convergence_start_iteration:
-        return config.intermediate_convergence_tolerance, 1, "intermediate convergence"
-
-    return config.late_convergence_tolerance, 1, "late convergence"
 
 
 def evaluate_convergence_status(
@@ -1626,34 +2068,73 @@ def evaluate_convergence_status(
 ) -> Tuple[bool, List[int], float, str]:
     """Evaluate ASF convergence for the current iteration.
 
-    Returns
-    -------
-    converged
-        True when the current iteration satisfies the tiered convergence rule.
-    non_converged_indices
-        Indices of species that do not satisfy the active convergence
-        tolerance.
-    active_tolerance
-        Convergence tolerance used for this iteration.
-    convergence_mode
-        Text label describing the active convergence regime.
-    """
-    finite = np.isfinite(change)
-    if not np.all(finite):
-        active_tolerance, _max_non_converged, convergence_mode = (
-            convergence_rule_for_iteration(iteration_id, config)
-        )
-        return False, [], active_tolerance, convergence_mode
+    Rules
+    -----
+    Iterations 2-6
+        Every species must satisfy |Delta abundance| <= 0.05 dex.
 
-    active_tolerance, max_non_converged, convergence_mode = (
-        convergence_rule_for_iteration(iteration_id, config)
+    Iterations 7-8
+        At most one species may remain above 0.05 dex.
+
+    Iterations 9-15
+        At most two species may remain above 0.05 dex, and no more than one
+        of those species may have |Delta abundance| > 0.10 dex.
+
+    Any species above 0.05 dex is returned in ``non_converged_indices`` so that
+    the late-history median treatment can be applied at finalization.
+    """
+    change = np.asarray(change, dtype=float)
+
+    # Treat a non-finite abundance change as a non-converged/oscillating
+    # species instead of forcing the entire convergence test to fail.
+    # If convergence is accepted under the tiered rule, its final abundance
+    # is recovered later from the median of its most recent finite values.
+    finite = np.isfinite(change)
+
+    active_tolerance = 0.05
+    non_converged_indices = np.where(
+        (~finite) | (change > active_tolerance)
+    )[0].astype(int).tolist()
+
+    # Iterations 2-6: all species must satisfy <= 0.05 dex.
+    if iteration_id < config.intermediate_convergence_start_iteration:
+        converged = len(non_converged_indices) == 0
+        return (
+            converged,
+            non_converged_indices,
+            active_tolerance,
+            "strict early convergence",
+        )
+
+    # Iterations 7-8: allow only one species above 0.05 dex.
+    if iteration_id < config.late_convergence_start_iteration:
+        converged = len(non_converged_indices) <= 1
+        return (
+            converged,
+            non_converged_indices,
+            active_tolerance,
+            "intermediate convergence",
+        )
+
+    # Iterations 9-15:
+    #   - zero or one species above 0.05 dex is accepted;
+    #   - if two species are above 0.05 dex, at least one of the two must be
+    #     <= 0.10 dex. Equivalently, no more than one species may exceed 0.10 dex.
+    #   - three or more species above 0.05 dex are not accepted.
+    n_above_005 = len(non_converged_indices)
+    n_above_010 = int(np.sum(np.isfinite(change) & (change > 0.10)))
+
+    converged = (
+        n_above_005 <= 2
+        and n_above_010 <= 1
     )
 
-    converged_mask = change <= active_tolerance
-    non_converged_indices = np.where(~converged_mask)[0].astype(int).tolist()
-    converged = len(non_converged_indices) <= max_non_converged
-
-    return converged, non_converged_indices, active_tolerance, convergence_mode
+    return (
+        converged,
+        non_converged_indices,
+        active_tolerance,
+        "late convergence",
+    )
 
 
 def late_history_median(
@@ -1740,276 +2221,214 @@ def apply_late_history_statistics(
 # Main pipeline
 # -----------------------------------------------------------------------------
 
+
 def run_autospecfit_abundance_pipeline(
     config: AutoSpecFitConfig,
     stellar_parameters: StellarParameters,
     species: SpeciesConfig,
 ) -> None:
-    """Run the AutoSpecFit-Abund v1.0 pipeline.
-
-    This function coordinates the full abundance workflow: reading inputs,
-    building model paths and Turbospectrum commands, running abundance
-    iterations, checking convergence, and writing output products.
-    """
+    """Run ASF v1.0 with fixed atmosphere, cumulative history, convergence, and restart support."""
     config.output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Convert the configured abundance grid to a numerical array used in
-    # chi-square fitting and parabolic uncertainty estimation.
     abundance_grid = np.asarray(config.abundance_values, dtype=float)
-
-    # Read the observed spectrum and apply the configured wavelength scaling.
     lam_star, flux_star, err_flux_star = read_observed_spectrum(
-        config.observed_spectrum_file,
-        config.observed_wavelength_scale,
+        config.observed_spectrum_file, config.observed_wavelength_scale
     )
-    # Read the selected diagnostic lines for every species.
     line_lists = read_all_line_lists(config, species)
-
-    # Store abundance history. Each column corresponds to one ASF iteration.
     n_total_iterations = 1 + config.n_followup_iterations
     mean_history = np.full((species.n_species, n_total_iterations), np.nan)
     rounded_history = np.full((species.n_species, n_total_iterations), np.nan)
-
-    # Record cases where a NaN abundance is replaced when constructing the
-    # fixed-abundance list for the next iteration.
+    current_abundance_errors = np.full(species.n_species, np.nan)
     nan_replacement_notes: List[str] = []
 
+    initialize_fresh_start_once(config)
+    checkpoint = load_restart_checkpoint(config, species, n_total_iterations)
+    abundance_history_path = Path(config.output_dir) / config.abundance_history_file
+    convergence_history_path = Path(config.output_dir) / config.convergence_history_file
+    fixed_parameter_path = Path(config.output_dir) / config.fixed_parameter_file
+
+    if checkpoint is None:
+        iteration_id = 1
+        next_stage = "abundance"
+        for path in (abundance_history_path, convergence_history_path, fixed_parameter_path):
+            if path.exists():
+                path.unlink()
+        write_fixed_parameter_table(fixed_parameter_path, stellar_parameters)
+        log_mode = "w"
+    else:
+        iteration_id = checkpoint["iteration_id"]
+        next_stage = checkpoint["next_stage"]
+        mean_history = checkpoint["mean_history"]
+        rounded_history = checkpoint["rounded_history"]
+        if len(checkpoint["abundance_errors"]) == species.n_species:
+            current_abundance_errors = checkpoint["abundance_errors"]
+        nan_replacement_notes = checkpoint["nan_replacement_notes"]
+        log_mode = "a"
+        if next_stage == "finished":
+            LOGGER.info("Checkpoint indicates that ASF v1.0 already finished successfully.")
+            return
+        if not fixed_parameter_path.exists():
+            write_fixed_parameter_table(fixed_parameter_path, stellar_parameters)
+
     log_path = Path(config.output_dir) / config.iteration_log_file
-    with open(log_path, "w", buffering=1) as log_handle:
-        log_handle.write("LineCenter BestFit_Abundance_PolyFit BestFit_Abundance_Original\n")
-        log_handle.write("==================================================================\n")
+    with open(log_path, log_mode, buffering=1) as log_handle:
+        if log_mode == "w":
+            log_handle.write("LineCenter BestFit_Abundance_PolyFit BestFit_Abundance_Original\n")
+            log_handle.write("==================================================================\n")
+        else:
+            log_handle.write(f"\n# ===== ASF v1.0 RESTART: stage={next_stage}, iteration={iteration_id} =====\n")
 
-        # First iteration: only the target element is varied in each model grid.
-        LOGGER.info("Starting AutoSpecFit-Abund iteration 1")
-        model_paths = first_iteration_model_paths(config, stellar_parameters, species)
-        turbospectrum_commands = first_iteration_turbospectrum_commands(
-            config=config,
-            stellar_parameters=stellar_parameters,
-            species=species,
-        )
-        results = run_iteration(
-            iteration_id=1,
-            model_paths=model_paths,
-            species=species,
-            line_lists=line_lists,
-            lam_star=lam_star,
-            flux_star=flux_star,
-            err_flux_star=err_flux_star,
-            config=config,
-            abundance_grid=abundance_grid,
-            turbospectrum_commands=turbospectrum_commands,
-            log_handle=log_handle,
-        )
-
-        mean_history[:, 0] = [result.mean_abundance for result in results]
-        rounded_history[:, 0] = [result.rounded_mean_abundance for result in results]
-
-        # Follow-up iterations: for each target element, fix all other element
-        # abundances to the values inferred in the previous iteration.
-        for followup_index in range(config.n_followup_iterations):
-            iteration_id = followup_index + 2
-            LOGGER.info("Starting AutoSpecFit-Abund iteration %d", iteration_id)
-
-            # The previous iteration abundances become the fixed abundances
-            # for all non-target elements in the next synthetic spectral grid.
-            previous_abundance_strings = []
-            current_nan_replacement_notes: List[str] = []
-
-            for species_index, value in enumerate(
-                rounded_history[:, iteration_id - 2]
-            ):
-                element_name = species.element_names[species_index]
-
-                if np.isfinite(value):
-                    previous_abundance_strings.append(f"{value:+.3f}")
+        while iteration_id <= n_total_iterations:
+            if next_stage == "abundance":
+                LOGGER.info("Starting AutoSpecFit-Abund v1.0 iteration %d", iteration_id)
+                if iteration_id == 1:
+                    model_paths = first_iteration_model_paths(config, stellar_parameters, species)
+                    commands = first_iteration_turbospectrum_commands(config, stellar_parameters, species)
                 else:
-                    earlier_values = rounded_history[
-                        species_index, : iteration_id - 2
-                    ]
-                    finite_earlier_values = earlier_values[
-                        np.isfinite(earlier_values)
-                    ]
+                    previous_abundance_strings: List[str] = []
+                    current_notes: List[str] = []
+                    for species_index, value in enumerate(rounded_history[:, iteration_id - 2]):
+                        element_name = species.element_names[species_index]
+                        if np.isfinite(value):
+                            previous_abundance_strings.append(format_abundance_filename_value(value))
+                        else:
+                            earlier = rounded_history[species_index, :iteration_id - 2]
+                            finite = earlier[np.isfinite(earlier)]
+                            if len(finite):
+                                replacement = float(finite[-1])
+                                previous_abundance_strings.append(format_abundance_filename_value(replacement))
+                                note = (
+                                    f"Iteration {iteration_id}: {element_name} abundance from iteration {iteration_id-1} is NaN; "
+                                    f"using {_normalize_negative_zero(replacement,3):+.3f} from the most recent valid previous iteration to generate models."
+                                )
+                            else:
+                                previous_abundance_strings.append("+0.000")
+                                note = (
+                                    f"Iteration {iteration_id}: {element_name} abundance from iteration {iteration_id-1} is NaN and no previous valid abundance exists; using +0.000 to generate models."
+                                )
+                            LOGGER.warning(note); log_handle.write(f"# {note}\n"); log_handle.flush()
+                            current_notes.append(note); nan_replacement_notes.append(note)
+                    append_nan_replacement_notes_to_mean_file(iteration_id - 1, current_notes, config)
+                    model_paths = followup_iteration_model_paths(config, stellar_parameters, species, previous_abundance_strings)
+                    commands = followup_iteration_turbospectrum_commands(config, stellar_parameters, species, previous_abundance_strings)
 
-                    if len(finite_earlier_values) > 0:
-                        replacement_value = float(finite_earlier_values[-1])
-                        previous_abundance_strings.append(
-                            f"{replacement_value:+.3f}"
-                        )
-                        note = (
-                            f"Iteration {iteration_id}: {element_name} abundance "
-                            f"from iteration {iteration_id - 1} is NaN; using "
-                            f"{replacement_value:+.3f} from the most recent "
-                            f"valid previous iteration to generate models."
-                        )
-                    else:
-                        previous_abundance_strings.append("+0.000")
-                        note = (
-                            f"Iteration {iteration_id}: {element_name} abundance "
-                            f"from iteration {iteration_id - 1} is NaN and no "
-                            f"previous valid abundance exists; using +0.000 "
-                            f"to generate models."
-                        )
-
-                    LOGGER.warning(note)
-                    log_handle.write(f"# {note}\n")
-                    log_handle.flush()
-                    current_nan_replacement_notes.append(note)
-                    nan_replacement_notes.append(note)
-
-            append_nan_replacement_notes_to_mean_file(
-                iteration_id=iteration_id - 1,
-                notes=current_nan_replacement_notes,
-                config=config,
-            )
-
-            model_paths = followup_iteration_model_paths(
-                config,
-                stellar_parameters,
-                species,
-                previous_abundance_strings,
-            )
-            turbospectrum_commands = followup_iteration_turbospectrum_commands(
-                config=config,
-                stellar_parameters=stellar_parameters,
-                species=species,
-                previous_abundance_strings=previous_abundance_strings,
-            )
-            results = run_iteration(
-                iteration_id=iteration_id,
-                model_paths=model_paths,
-                species=species,
-                line_lists=line_lists,
-                lam_star=lam_star,
-                flux_star=flux_star,
-                err_flux_star=err_flux_star,
-                config=config,
-                abundance_grid=abundance_grid,
-                turbospectrum_commands=turbospectrum_commands,
-                log_handle=log_handle,
-            )
-
-            mean_history[:, iteration_id - 1] = [result.mean_abundance for result in results]
-            rounded_history[:, iteration_id - 1] = [result.rounded_mean_abundance for result in results]
-
-            # Evaluate convergence using a tiered set of criteria.
-            #
-            # Iterations 2-6 require all species to converge using the strict
-            # early tolerance. Iterations 7-8 allow one non-converged species
-            # using the intermediate tolerance. Iterations 9-12 use the late
-            # tolerance and also allow one non-converged species. Any allowed
-            # non-converged species is assigned a final abundance using the
-            # median of its final finite iteration values.
-            change = np.abs(mean_history[:, iteration_id - 1] - mean_history[:, iteration_id - 2])
-            (
-                converged,
-                non_converged_indices,
-                active_tolerance,
-                convergence_mode,
-            ) = evaluate_convergence_status(
-                change,
-                iteration_id,
-                config,
-            )
-
-            # If this is the maximum iteration and the tiered convergence
-            # criteria are still not satisfied, write a final abundance table
-            # anyway. Species that remain non-converged with respect to the
-            # late tolerance are assigned the median of their final finite
-            # iteration abundances.
-            reached_maximum_iteration = iteration_id == n_total_iterations
-            forced_final_iteration = False
-            if not converged and reached_maximum_iteration:
-                forced_final_iteration = True
-                active_tolerance = config.late_convergence_tolerance
-                convergence_mode = "maximum-iteration finalization"
-                non_converged_indices = np.where((~np.isfinite(change)) | (change > active_tolerance))[0].astype(int).tolist()
-                converged = True
-
-            if converged:
-                final_not_rounded = mean_history[:, iteration_id - 1].copy()
-                final_rounded = np.round(rounded_history[:, iteration_id - 1], 2)
-
-                if non_converged_indices:
-                    if forced_final_iteration:
-                        context = (
-                            f"did not satisfy the final convergence tolerance "
-                            f"({active_tolerance:.3f} dex) at the maximum "
-                            f"iteration"
-                        )
-                    else:
-                        context = (
-                            f"was treated as oscillating under the "
-                            f"{convergence_mode} criterion "
-                            f"({active_tolerance:.3f} dex)"
-                        )
-
-                    apply_late_history_statistics(
-                        final_not_rounded=final_not_rounded,
-                        final_rounded=final_rounded,
-                        indices=non_converged_indices,
-                        mean_history=mean_history,
-                        iteration_id=iteration_id,
-                        species=species,
-                        config=config,
-                        log_handle=log_handle,
-                        notes=nan_replacement_notes,
-                        context=context,
-                    )
-
-                if forced_final_iteration:
-                    note = (
-                        f"Maximum iteration {iteration_id} reached before a "
-                        f"tiered convergence criterion was satisfied. Final "
-                        f"abundances were written using the last iteration for "
-                        f"converged species and late-history medians for "
-                        f"non-converged species."
-                    )
-                elif non_converged_indices:
-                    note = (
-                        f"Convergence accepted at iteration {iteration_id} "
-                        f"under the {convergence_mode} criterion: all but "
-                        f"{len(non_converged_indices)} species satisfied "
-                        f"the {active_tolerance:.3f} dex tolerance."
-                    )
-                else:
-                    note = (
-                        f"Convergence accepted at iteration {iteration_id} "
-                        f"under the {convergence_mode} criterion: all species "
-                        f"satisfied the {active_tolerance:.3f} dex tolerance."
-                    )
-
-                LOGGER.info(note)
-                log_handle.write(f"# {note}\n")
-                log_handle.flush()
-                nan_replacement_notes.append(note)
-
-                final_errors = species_abundance_errors_from_iteration(results)
-                write_final_abundance_table(
-                    final_not_rounded=final_not_rounded,
-                    final_rounded=final_rounded,
-                    final_errors=final_errors,
-                    species=species,
-                    config=config,
-                    nan_replacement_notes=nan_replacement_notes,
+                results = run_iteration(
+                    iteration_id, model_paths, stellar_parameters, species, line_lists,
+                    lam_star, flux_star, err_flux_star, config, abundance_grid, commands, log_handle,
                 )
-                return
+                mean_history[:, iteration_id - 1] = [r.mean_abundance for r in results]
+                rounded_history[:, iteration_id - 1] = [r.rounded_mean_abundance for r in results]
+                current_abundance_errors = species_abundance_errors_from_iteration(results)
+                update_abundance_history_table(
+                    abundance_history_path, iteration_id, species,
+                    mean_history[:, iteration_id - 1], rounded_history[:, iteration_id - 1], current_abundance_errors,
+                )
+                next_stage = "convergence" if iteration_id >= 2 else "abundance"
+                if iteration_id == 1:
+                    iteration_id = 2
+                save_restart_checkpoint(
+                    config, next_stage=next_stage, iteration_id=iteration_id,
+                    mean_history=mean_history, rounded_history=rounded_history,
+                    abundance_errors=current_abundance_errors, nan_replacement_notes=nan_replacement_notes,
+                )
+                if next_stage == "abundance":
+                    continue
 
-        # This block is normally not reached because the maximum-iteration
-        # finalization step inside the loop writes a final table at the last
-        # iteration. It is retained as a safety fallback.
-        LOGGER.warning(
-            "Iteration loop ended without an accepted convergence condition; "
-            "writing the last available iteration as the final result."
-        )
-        final_errors = species_abundance_errors_from_iteration(results)
-        write_final_abundance_table(
-            final_not_rounded=mean_history[:, -1],
-            final_rounded=np.round(rounded_history[:, -1], 2),
-            final_errors=final_errors,
-            species=species,
-            config=config,
-            nan_replacement_notes=nan_replacement_notes,
-        )
+            if next_stage == "convergence":
+                change = np.abs(mean_history[:, iteration_id - 1] - mean_history[:, iteration_id - 2])
+                abundance_converged, non_converged_indices, active_tolerance, convergence_mode = evaluate_convergence_status(
+                    change, iteration_id, config
+                )
+                reached_maximum = iteration_id == n_total_iterations
+                decision = "FINALIZE_CONVERGED" if abundance_converged else ("FINALIZE_MAXIMUM_ITERATION_NOT_CONVERGED" if reached_maximum else "CONTINUE")
+                update_convergence_history_table(
+                    convergence_history_path, iteration_id, species,
+                    mean_history[:, iteration_id - 2], mean_history[:, iteration_id - 1], change,
+                    abundance_converged, convergence_mode, reached_maximum, decision, config,
+                )
+
+                if abundance_converged or reached_maximum:
+                    final_seed_not_rounded = mean_history[:, iteration_id - 1].copy()
+                    final_seed_rounded = rounded_history[:, iteration_id - 1].copy()
+                    if reached_maximum and not abundance_converged:
+                        # At a hard stop, every species still above 0.05 dex (or non-finite)
+                        # receives the median of its final finite values.
+                        non_converged_indices = np.where((~np.isfinite(change)) | (change > 0.05))[0].astype(int).tolist()
+                        context = "did not satisfy the 0.05 dex abundance tolerance at the maximum iteration"
+                    else:
+                        context = f"was treated as oscillating under the {convergence_mode} criterion ({active_tolerance:.3f} dex)"
+                    if non_converged_indices:
+                        apply_late_history_statistics(
+                            final_seed_not_rounded, final_seed_rounded, non_converged_indices,
+                            mean_history, iteration_id, species, config, log_handle,
+                            nan_replacement_notes, context,
+                        )
+
+                    if abundance_converged:
+                        note = f"Abundance convergence accepted at iteration {iteration_id} under the {convergence_mode} criterion."
+                    else:
+                        note = f"Maximum iteration {iteration_id} reached before the abundance convergence criterion was satisfied; finalization is a hard-stop result, not convergence."
+                    LOGGER.info(note); log_handle.write(f"# {note}\n"); log_handle.flush(); nan_replacement_notes.append(note)
+                    convergence_summary = [
+                        f"Iterative cycle: {iteration_id}",
+                        f"Abundance criterion satisfied: {'YES' if abundance_converged else 'NO'}",
+                        "Atmospheric-parameter criterion: N/A (fixed atmosphere in ASF v1.0)",
+                        f"Decision: {decision}",
+                        f"Rule: {_abundance_convergence_rule_text(iteration_id, config)}",
+                    ]
+
+                    # Dedicated final abundance fit with the atmosphere fixed and the adopted
+                    # iterative abundances used only as the non-target abundance seeds.
+                    final_seed_strings: List[str] = []
+                    for species_index, value in enumerate(final_seed_rounded):
+                        element_name = species.element_names[species_index]
+                        if np.isfinite(value):
+                            final_seed_strings.append(format_abundance_filename_value(value))
+                        else:
+                            earlier = rounded_history[species_index, :iteration_id]
+                            finite = earlier[np.isfinite(earlier)]
+                            if len(finite):
+                                replacement = float(finite[-1])
+                                final_seed_strings.append(format_abundance_filename_value(replacement))
+                                replacement_note = f"Final abundance fit: {element_name} seed is NaN; using {_normalize_negative_zero(replacement,3):+.3f} from the most recent finite iterative abundance."
+                            else:
+                                final_seed_strings.append("+0.000")
+                                replacement_note = f"Final abundance fit: {element_name} seed is NaN and no finite previous abundance exists; using +0.000."
+                            LOGGER.warning(replacement_note); log_handle.write(f"# {replacement_note}\n"); nan_replacement_notes.append(replacement_note)
+
+                    final_iteration_id = iteration_id + 1
+                    final_model_paths = followup_iteration_model_paths(config, stellar_parameters, species, final_seed_strings)
+                    final_commands = followup_iteration_turbospectrum_commands(config, stellar_parameters, species, final_seed_strings)
+                    final_results = run_iteration(
+                        final_iteration_id, final_model_paths, stellar_parameters, species, line_lists,
+                        lam_star, flux_star, err_flux_star, config, abundance_grid, final_commands, log_handle,
+                    )
+                    final_not_rounded = np.asarray([r.mean_abundance for r in final_results], dtype=float)
+                    final_rounded = np.asarray([r.rounded_mean_abundance for r in final_results], dtype=float)
+                    final_errors = species_abundance_errors_from_iteration(final_results)
+                    update_abundance_history_table(
+                        abundance_history_path, final_iteration_id, species,
+                        final_not_rounded, final_rounded, final_errors, final_iteration=True,
+                    )
+                    write_final_abundance_table(
+                        final_not_rounded, final_rounded, final_errors, stellar_parameters,
+                        species, config, nan_replacement_notes, convergence_summary,
+                    )
+                    save_restart_checkpoint(
+                        config, next_stage="finished", iteration_id=iteration_id,
+                        mean_history=mean_history, rounded_history=rounded_history,
+                        abundance_errors=final_errors, nan_replacement_notes=nan_replacement_notes,
+                    )
+                    return
+
+                iteration_id += 1
+                next_stage = "abundance"
+                save_restart_checkpoint(
+                    config, next_stage=next_stage, iteration_id=iteration_id,
+                    mean_history=mean_history, rounded_history=rounded_history,
+                    abundance_errors=current_abundance_errors, nan_replacement_notes=nan_replacement_notes,
+                )
+
+        raise RuntimeError("ASF v1.0 iteration loop ended without convergence or maximum-iteration finalization.")
 
 
 # -----------------------------------------------------------------------------
