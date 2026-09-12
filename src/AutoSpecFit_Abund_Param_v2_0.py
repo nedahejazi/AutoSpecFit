@@ -837,7 +837,7 @@ def write_iteration_chi2_table(
     output_path = Path(output_dir) / config.current_abundance_chi2_file
     with open(output_path, "w") as handle:
         handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
-        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
 
 
 def write_iteration_abundance_error_table(
@@ -857,7 +857,7 @@ def write_iteration_abundance_error_table(
     output_path = Path(output_dir) / config.current_abundance_line_error_file
     with open(output_path, "w") as handle:
         handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
-        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
 
 
 def write_species_mean_table(
@@ -876,7 +876,7 @@ def write_species_mean_table(
     })
     with open(output_path, "w") as handle:
         handle.write(f"# Stage: ABUNDANCE ITERATION\n# Iteration: {iteration_id}\n")
-        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
 
 
 def convert_asf_offsets_to_xh(
@@ -1010,7 +1010,7 @@ def write_final_abundance_table(
             handle.write("#\n# Iterative convergence summary\n")
             for line in convergence_summary:
                 handle.write(f"# {line}\n")
-        table.to_csv(handle, sep=" ", index=False, header=True, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, header=True, float_format="%.6f", na_rep="nan")
 
     if nan_replacement_notes:
         with open(output_path, "a") as handle:
@@ -3188,7 +3188,7 @@ def rebuild_history_outputs_from_restart(
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class ParameterDiagnosticLines:
     """All spectral lines available for atmospheric-parameter refinement."""
 
@@ -4026,7 +4026,7 @@ def write_current_parameter_table(
             f"# Stage: PARAMETER ITERATION\n# Iteration: {iteration_id}\n"
             f"# Parameter_Pass: {parameter_pass}\n# Completed_Step: {completed_step}\n"
         )
-        table.to_csv(handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan")
+        table.to_csv(handle, sep=" ", index=False, float_format="%.6f", na_rep="nan")
 
 
 def write_final_parameter_table(
@@ -4077,7 +4077,7 @@ def write_final_parameter_table(
             for line in convergence_summary:
                 handle.write(f"# {line}\n")
         table.to_csv(
-            handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 6), na_rep="nan"
+            handle, sep=" ", index=False, float_format="%.6f", na_rep="nan"
         )
     LOGGER.info("Wrote final stellar-parameter table: %s", output_path)
 
@@ -4205,7 +4205,7 @@ def evaluate_parameter_grid(
             f"# Parameter_Pass: {parameter_pass}\n# Parameter: {parameter_name}\n"
         )
         pd.DataFrame(curve_output).to_csv(
-            handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 8), na_rep="nan"
+            handle, sep=" ", index=False, float_format="%.8f", na_rep="nan"
         )
 
     # Save one row per diagnostic line with its independent parameter result.
@@ -4229,7 +4229,7 @@ def evaluate_parameter_grid(
             f"# Parameter_Pass: {parameter_pass}\n# Parameter: {parameter_name}\n"
         )
         result_table.to_csv(
-            handle, sep=" ", index=False, float_format=lambda value: _format_output_float(value, 8), na_rep="nan"
+            handle, sep=" ", index=False, float_format="%.8f", na_rep="nan"
         )
 
     # Append the ensemble statistics as comments.
@@ -5461,12 +5461,10 @@ def run_autospecfit_abundance_pipeline(
                     random_errors=current_abundance_errors,
                 )
 
-                # Abundance iteration N is followed by the refinement that
-                # produces parameter iteration N+1.
-                if config.refine_parameters_after_each_iteration:
-                    next_stage = "parameter"
-                else:
-                    next_stage = "convergence"
+                # Parameter iteration N is the atmosphere already used by
+                # abundance iteration N. Assess convergence for the matched pair
+                # (P_N, A_N) before deciding whether P_{N+1} is needed.
+                next_stage = "convergence"
 
                 save_restart_checkpoint(
                     config,
@@ -5570,7 +5568,10 @@ def run_autospecfit_abundance_pipeline(
                     current_stellar_parameters.alpha,
                 )
 
-                next_stage = "convergence"
+                # P_{N+1} has now been produced from A_N. Advance the shared
+                # iteration number so abundance iteration N+1 uses exactly P_{N+1}.
+                iteration_id += 1
+                next_stage = "abundance"
                 save_restart_checkpoint(
                     config,
                     next_stage=next_stage,
@@ -5812,9 +5813,12 @@ def run_autospecfit_abundance_pipeline(
                     )
                     return
 
-                # Not converged: advance to the next abundance iteration.
-                iteration_id += 1
-                next_stage = "abundance"
+                # Not converged: derive P_{N+1} from A_N before running A_{N+1}.
+                if config.refine_parameters_after_each_iteration:
+                    next_stage = "parameter"
+                else:
+                    iteration_id += 1
+                    next_stage = "abundance"
                 save_restart_checkpoint(
                     config,
                     next_stage=next_stage,
