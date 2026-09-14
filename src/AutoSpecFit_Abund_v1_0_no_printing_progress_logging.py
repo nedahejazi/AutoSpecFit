@@ -180,6 +180,9 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d
 
+# Numerical/operational margin applied to the nominal abundance-convergence thresholds.
+ABUNDANCE_CONVERGENCE_MARGIN = 0.0049
+
 # AutoSpecNorm performs local pseudo-continuum normalization and returns the
 # normalization uncertainty propagated into the abundance chi-square calculation.
 from AutoSpecNorm_Regions import AutoSpecNorm_Regions
@@ -1033,8 +1036,8 @@ def update_convergence_history_table(
     for element, previous, current, delta in zip(
         species.element_names, previous_abundances, current_abundances, change
     ):
-        above005 = (not np.isfinite(delta)) or delta > 0.05
-        above010 = np.isfinite(delta) and delta > 0.10
+        above005 = (not np.isfinite(delta)) or delta > 0.05 + ABUNDANCE_CONVERGENCE_MARGIN
+        above010 = np.isfinite(delta) and delta > 0.10 + ABUNDANCE_CONVERGENCE_MARGIN
         block.append(
             f"{element:<7}   {_format_history_float(previous):>18}   "
             f"{_format_history_float(current):>17}   {_format_history_float(delta):>10}   "
@@ -2093,7 +2096,7 @@ def evaluate_convergence_status(
 
     active_tolerance = 0.05
     non_converged_indices = np.where(
-        (~finite) | (change > active_tolerance)
+        (~finite) | (change > active_tolerance + ABUNDANCE_CONVERGENCE_MARGIN)
     )[0].astype(int).tolist()
 
     # Iterations 2-5: all species must satisfy <= 0.05 dex.
@@ -2122,7 +2125,7 @@ def evaluate_convergence_status(
     #     <= 0.10 dex. Equivalently, no more than one species may exceed 0.10 dex.
     #   - three or more species above 0.05 dex are not accepted.
     n_above_005 = len(non_converged_indices)
-    n_above_010 = int(np.sum(np.isfinite(change) & (change > 0.10)))
+    n_above_010 = int(np.sum(np.isfinite(change) & (change > 0.10 + ABUNDANCE_CONVERGENCE_MARGIN)))
 
     converged = (
         n_above_005 <= 2
@@ -2352,7 +2355,7 @@ def run_autospecfit_abundance_pipeline(
                     if reached_maximum and not abundance_converged:
                         # At a hard stop, every species still above 0.05 dex (or non-finite)
                         # receives the median of its final finite values.
-                        non_converged_indices = np.where((~np.isfinite(change)) | (change > 0.05))[0].astype(int).tolist()
+                        non_converged_indices = np.where((~np.isfinite(change)) | (change > 0.05 + ABUNDANCE_CONVERGENCE_MARGIN))[0].astype(int).tolist()
                         context = "did not satisfy the 0.05 dex abundance tolerance at the maximum iteration"
                     else:
                         context = f"was treated as oscillating under the {convergence_mode} criterion ({active_tolerance:.3f} dex)"
