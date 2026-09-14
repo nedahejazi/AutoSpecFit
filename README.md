@@ -27,7 +27,7 @@ ASF currently includes two analysis scripts. `AutoSpecFit_Abund_v1_0.py` perform
 - Line-by-line chi-square minimization and uncertainty estimation.
 - Propagation of final atmospheric-parameter uncertainties into systematic abundance uncertainties.
 - Restart/checkpoint support for long abundance and parameter-fitting runs.
-- Designed for high-resolution spectra of cool stars.
+- Originally designed for high-resolution spectra of cool M dwarfs, but also readily applicable to significantly less complicated spectra of FGK dwarfs.
 - Primarily tested on IGRINS spectra with resolving power R ≈ 45,000, but also applicable to high-resolution optical spectra.
 - Compatible with Turbospectrum v15.1 through user-supplied external synthesis scripts.
 
