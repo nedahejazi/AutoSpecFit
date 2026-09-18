@@ -59,8 +59,10 @@ the external synthesis/convolution setup if required.
 
 In this configuration, atmospheric-parameter and abundance iterations alternate
 to approach a self-consistent solution. Once the adopted convergence/finalization
-criteria are satisfied, the abundances from the final iterative abundance step
-are retained as the final abundance solution.
+criteria are satisfied, the accepted atmospheric parameters are held fixed and a
+dedicated final abundance-only pass independently refits each element against the
+same converged background ASF-offset vector. These dedicated abundances are the
+reported final solution and are used for the subsequent systematic-error analysis.
 
 AutoSpecNorm
 ------------
@@ -829,7 +831,7 @@ def write_iteration_chi2_table(
     line_labels = [result.label for result in line_results]
     table = pd.DataFrame(
         np.column_stack([abundances, *chi2_columns]),
-        columns=["abundance", *line_labels],
+        columns=["ASF_Offset", *line_labels],
     )
     output_path = Path(output_dir) / config.current_abundance_chi2_file
     with open(output_path, "w") as handle:
@@ -864,11 +866,11 @@ def write_species_mean_table(
     random_errors: np.ndarray,
     config: AutoSpecFitConfig,
 ) -> None:
-    """Overwrite the rolling species summary with the newest abundance results."""
+    """Overwrite the rolling species summary with the newest native ASF-offset results."""
     output_path = Path(config.output_dir) / config.current_abundance_summary_file
     table = pd.DataFrame({
         "Element": species.element_names,
-        "Abundance": mean_abundances,
+        "ASF_Offset": mean_abundances,
         "Random_Error": random_errors,
     })
     with open(output_path, "w") as handle:
@@ -2748,7 +2750,7 @@ def update_abundance_history_table(
                     prefix = f"Iteration_{old_iteration}"
                     block = [
                         f"Iteration {old_iteration}",
-                        "Element   Abundance   Rounded_Abundance   Random_Error",
+                        "Element   ASF_Offset   Rounded_ASF_Offset   Random_Error",
                     ]
                     for element in elements:
                         abundance = old_table.at[element, f"{prefix}_Abundance"]
@@ -2765,7 +2767,7 @@ def update_abundance_history_table(
 
     block = [
         f"Iteration {iteration_id}",
-        "Element   Abundance   Rounded_Abundance   Random_Error",
+        "Element   ASF_Offset   Rounded_ASF_Offset   Random_Error",
     ]
     for element, abundance, rounded, error in zip(
         elements, abundances, rounded_abundances, random_errors
@@ -2780,7 +2782,7 @@ def update_abundance_history_table(
     _write_vertical_history_blocks(
         path,
         [
-            "# Cumulative elemental-abundance history for GJ205",
+            "# Cumulative elemental-abundance history",
             "# Each iteration is listed below the previous iteration.",
         ],
         blocks,
@@ -4900,6 +4902,98 @@ def parameter_numeric_value(
     return float(getattr(stellar_parameters, attr))
 
 
+def run_final_dedicated_abundance_solution(
+    stellar_parameters: StellarParameters,
+    fixed_seed_abundances: np.ndarray,
+    species: SpeciesConfig,
+    line_lists: List[LineList],
+    lam_star: np.ndarray,
+    flux_star: np.ndarray,
+    err_flux_star: np.ndarray,
+    config: AutoSpecFitConfig,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run one final abundance-only ASF pass at the accepted fixed atmosphere.
+
+    Every target element is varied once over the standard ASF-offset grid while
+    all non-target elements are held to the same finalized seed pattern. This
+    pass is deliberately performed after atmospheric-parameter convergence so
+    the reported final ASF offsets are all measured against one common final
+    atmosphere and one common background abundance pattern.
+
+    Returns
+    -------
+    refined_offsets
+        Continuous species-level ASF offsets from the dedicated pass.
+    rounded_offsets
+        Refined ASF offsets rounded to 0.001 dex for reporting/model naming.
+    random_errors
+        Random abundance uncertainties calculated from the dedicated line fits.
+    """
+    seed = np.asarray(fixed_seed_abundances, dtype=float)
+    if len(seed) != species.n_species or not np.all(np.isfinite(seed)):
+        raise ValueError(
+            "Final dedicated abundance seed must contain one finite ASF offset "
+            "for every species."
+        )
+
+    fixed_strings = [format_abundance_filename_value(value) for value in seed]
+    model_paths = followup_iteration_model_paths(
+        config, stellar_parameters, species, fixed_strings
+    )
+    commands = followup_iteration_turbospectrum_commands(
+        config=config,
+        stellar_parameters=stellar_parameters,
+        species=species,
+        previous_abundance_strings=fixed_strings,
+    )
+
+    missing_before_submission = require_models_or_ts_enabled(
+        model_paths,
+        config.run_turbospectrum,
+        "FINAL DEDICATED ABUNDANCE PASS",
+    )
+    if config.run_turbospectrum:
+        runner = select_turbospectrum_runner(stellar_parameters, config)
+        if missing_before_submission:
+            LOGGER.info(
+                "FINAL DEDICATED ABUNDANCE PASS: %d required model(s) are missing "
+                "or empty; submitting Turbospectrum.",
+                len(missing_before_submission),
+            )
+        for command in commands:
+            run_turbospectrum_command(
+                command=command,
+                runner=runner,
+                execution_prefix=config.turbospectrum_execution_prefix,
+            )
+
+    wait_for_model_files(model_paths, config)
+    abundance_grid = np.asarray(config.abundance_values, dtype=float)
+    results: List[SpeciesIterationResult] = []
+    for species_index in range(species.n_species):
+        results.append(
+            fit_species_in_iteration(
+                iteration_id=0,
+                species_index=species_index,
+                species=species,
+                line_list=line_lists[species_index],
+                species_model_paths=model_paths[species_index],
+                lam_star=lam_star,
+                flux_star=flux_star,
+                err_flux_star=err_flux_star,
+                config=config,
+                abundance_grid=abundance_grid,
+                log_handle=None,
+                log_context="FINAL DEDICATED ABUNDANCE PASS",
+            )
+        )
+
+    refined = np.asarray([result.mean_abundance for result in results], dtype=float)
+    rounded = np.asarray([result.rounded_mean_abundance for result in results], dtype=float)
+    random_errors = species_abundance_errors_from_iteration(results)
+    return refined, rounded, random_errors
+
+
 def run_systematic_abundance_error_analysis(
     final_stellar_parameters: StellarParameters,
     parameter_errors: Dict[str, float],
@@ -5840,8 +5934,55 @@ def run_autospecfit_abundance_pipeline(
                         convergence_summary=convergence_summary,
                     )
 
-                    # Propagate each atmospheric-parameter uncertainty into the
-                    # elemental abundances one parameter at a time.
+                    # Run one final dedicated abundance-only pass at the accepted
+                    # atmosphere. Build one common finite ASF-offset seed pattern.
+                    # If a finalized species is NaN, use its most recent finite
+                    # rounded ASF offset from the iterative history only as the fixed
+                    # background seed; the target itself is still refitted normally.
+                    dedicated_seed = np.asarray(final_rounded, dtype=float).copy()
+                    for species_index in range(species.n_species):
+                        if np.isfinite(dedicated_seed[species_index]):
+                            continue
+                        finite_history = rounded_history[
+                            species_index, :iteration_id
+                        ]
+                        finite_history = finite_history[np.isfinite(finite_history)]
+                        if len(finite_history) > 0:
+                            dedicated_seed[species_index] = float(finite_history[-1])
+                            note = (
+                                f"Final dedicated pass: {species.element_names[species_index]} "
+                                f"final iterative ASF offset is NaN; using "
+                                f"{dedicated_seed[species_index]:+.3f} from the most recent "
+                                f"finite iteration as the fixed background seed."
+                            )
+                        else:
+                            dedicated_seed[species_index] = 0.0
+                            note = (
+                                f"Final dedicated pass: {species.element_names[species_index]} "
+                                f"has no finite iterative ASF offset; using +0.000 only as "
+                                f"the fixed background seed."
+                            )
+                        nan_replacement_notes.append(note)
+                        LOGGER.warning(note)
+
+                    (
+                        final_not_rounded,
+                        final_rounded,
+                        current_abundance_errors,
+                    ) = run_final_dedicated_abundance_solution(
+                        stellar_parameters=current_stellar_parameters,
+                        fixed_seed_abundances=dedicated_seed,
+                        species=species,
+                        line_lists=line_lists,
+                        lam_star=lam_star,
+                        flux_star=flux_star,
+                        err_flux_star=err_flux_star,
+                        config=config,
+                    )
+
+                    # Propagate the final atmospheric-parameter uncertainties around
+                    # the DEDICATED final ASF-offset solution. The dedicated random
+                    # errors are also used in the final total-error calculation.
                     (
                         systematic_errors,
                         total_abundance_errors,
