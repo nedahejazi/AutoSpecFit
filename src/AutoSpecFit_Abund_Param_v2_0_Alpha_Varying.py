@@ -14,20 +14,15 @@ AutoSpecFit (ASF) is an automated line-by-line spectral synthesis pipeline
 designed for high-resolution elemental abundance measurements of cool stars.
 
 The current ASF workflow proceeds as follows:
-    1. Reading the observed stellar spectrum.
-    2. Reading species-specific line-list files.
-    3. Preparing abundance grids and launching Turbospectrum to generate
-       synthetic spectra.
-    4. Waiting for all required synthetic spectra to become available.
-    5. Performing local pseudo-continuum normalization with AutoSpecNorm.
-    6. Computing line-by-line chi-square abundance curves.
-    7. Determining best-fit abundances and abundance uncertainties for
-       individual spectral lines.
-    8. Combining line abundances into species-level abundances through
-       iterative rejection, clipping, and weighting procedures.
-    9. Updating fixed elemental abundances between iterations and
-       regenerating synthetic spectra when required.
-   10. Writing final abundances and iteration results to output files.
+    1. Reading the observed stellar spectrum and species-specific line lists.
+    2. Running abundance iteration 1 with the initial adopted atmospheric parameters.
+    3. Refining the atmospheric parameters sequentially in two passes.
+    4. Alternating abundance and parameter iterations toward a self-consistent solution.
+    5. Applying the staged abundance and parameter convergence criteria.
+    6. After convergence, running a dedicated final abundance-only fit at the
+       accepted atmosphere using one common fixed background abundance pattern.
+    7. Propagating atmospheric-parameter uncertainties into the final abundances
+       and writing the final science products.
 
 Current Release
 ---------------
@@ -46,9 +41,9 @@ An additional fitted synthesis parameter in this configuration is:
 
     - Microturbulent velocity (vmic)
 
-The alpha enhancement ([alpha/Fe]) is fixed at its original input value for the
-entire calculation; it is not fitted, iterated, or included in the systematic
-abundance-error propagation. Microturbulence starts at 1.00 km s^-1 and is
+The alpha enhancement ([alpha/Fe]) is treated as a free atmospheric parameter,
+fitted and iterated together with Teff, log g, [M/H], and vmic, and included in
+the systematic abundance-error propagation. Microturbulence starts at 1.00 km s^-1 and is
 refined between abundance iterations. After convergence, the fitted parameter
 uncertainties are propagated into the elemental abundances one parameter at a
 time to estimate systematic abundance uncertainties.
@@ -57,12 +52,15 @@ Projected rotational broadening is not a fitted parameter in this Python file;
 any rotational-broadening treatment must therefore be handled consistently by
 the external synthesis/convolution setup if required.
 
-In this configuration, atmospheric-parameter and abundance iterations alternate
-to approach a self-consistent solution. Once the adopted convergence/finalization
-criteria are satisfied, the accepted atmospheric parameters are held fixed and a
-dedicated final abundance-only pass independently refits each element against the
-same converged background ASF-offset vector. These dedicated abundances are the
-reported final solution and are used for the subsequent systematic-error analysis.
+In this configuration, abundance iteration 1 is evaluated with the initial adopted
+atmospheric parameters, which are also recorded as parameter iteration 1. The first
+spectroscopic parameter refinement is then performed after abundance iteration 1 and
+defines parameter iteration 2, which is used by abundance iteration 2. The matched
+parameter--abundance iterations subsequently alternate toward a self-consistent
+solution. After convergence, a dedicated final abundance-only pass is performed at
+the accepted atmosphere using one common fixed background abundance pattern; those
+dedicated ASF offsets are adopted as the final abundances and as the reference
+solution for the systematic-uncertainty calculations.
 
 AutoSpecNorm
 ------------
@@ -147,20 +145,20 @@ For non-alpha elements, the final abundance is computed as:
 
 [X/H] = [M/H]final + ASF(X)
 
-For alpha elements (e.g., O, Mg, Si, Ca, and Ti), the fixed alpha enhancement
+For alpha elements (e.g., O, Mg, Si, Ca, and Ti), the fitted alpha enhancement
 adopted in the model atmosphere must also be included:
 
-[X/H] = [M/H]final + [alpha/Fe]fixed + ASF(X)
+[X/H] = [M/H]final + [alpha/Fe]final + ASF(X)
 
 where ASF(X) is the abundance offset measured by ASF for element X, [M/H]final is
 the final adopted metallicity from the Version 2 parameter solution, and
-[alpha/Fe]fixed is the original adopted alpha-element enhancement, which
-remains unchanged throughout the calculation.
+[alpha/Fe]final is the alpha-element enhancement determined by the final
+atmospheric-parameter solution.
 
 For example, for magnesium (Mg), which is an alpha element:
 
 [M/H]final      = -0.30
-[alpha/Fe]fixed = +0.12
+[alpha/Fe]final = +0.12
 ASF(Mg)         = +0.15
 
 [Mg/H] = -0.30 + 0.12 + 0.15 = -0.03
@@ -176,6 +174,9 @@ DOI: 10.3847/1538-3881/add696
 
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Directory containing this Python script; local sensitivity inputs are resolved here.
+SCRIPT_DIR = Path(__file__).resolve().parent
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import logging
 import json
@@ -184,9 +185,6 @@ import os
 import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d
-
-# Numerical/operational margin applied to the nominal abundance-convergence thresholds.
-ABUNDANCE_CONVERGENCE_MARGIN = 0.0049
 
 # AutoSpecNorm performs local pseudo-continuum normalization and returns the
 # normalization uncertainty propagated into the abundance chi-square calculation.
@@ -197,12 +195,27 @@ from AutoSpecNorm_Regions import AutoSpecNorm_Regions
 # Logging
 # -----------------------------------------------------------------------------
 
+RUN_START_TIME = time.perf_counter()
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+class _ElapsedTimeFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.elapsed = _format_elapsed(time.perf_counter() - RUN_START_TIME)
+        return True
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | +%(elapsed)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOGGER = logging.getLogger(__name__)
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_ElapsedTimeFilter())
 
 
 # -----------------------------------------------------------------------------
@@ -215,13 +228,13 @@ class StellarParameters:
 
     In ASF v2.0, these values provide the starting atmosphere and are updated
     during the iterative parameter-refinement cycles for Teff, log g, [M/H],
-    [alpha/Fe], and vmic.  The stored strings are also used consistently in
+    vmic, and [alpha/Fe]. The stored strings are also used consistently in
     synthetic-spectrum filenames and Turbospectrum execution commands.
     """
 
     teff: str = "3700"
     logg: str = "+4.7"
-    metallicity: str = "+0.20"
+    metallicity: str = "+0.10"
     alpha: str = "+0.00"
     vmic: str = "1.00"
 
@@ -318,7 +331,7 @@ class AutoSpecFitConfig:
 
     # Directory containing the synthetic spectra generated by Turbospectrum.
     # ASF waits for and reads the model spectra from this location.
-    model_dir: Path = Path("/home/nedahejazi/Synthetic_Spectra_APOGEE_GJ251")
+    model_dir: Path = Path("/home/nedahejazi/Synthetic_Spectra_APOGEE_GJ205")
 
     # Directory where all ASF output products are written.
     output_dir: Path = Path(".")
@@ -335,7 +348,7 @@ class AutoSpecFitConfig:
     #
     #     Species_OH_H_K_band_GJ205.txt
     #
-    # Each file should contain the selected diagnostic lines for one species.
+    # Each file should contain the selected abundance lines for one species.
     species_file_prefix: str = "Species_"
     species_file_suffix: str = "_H_K_band_GJ205.txt"
 
@@ -346,17 +359,17 @@ class AutoSpecFitConfig:
     # Rolling progress/output files. These files are overwritten with the newest
     # completed abundance or parameter results instead of creating one file per
     # iteration. Restart state remains stored separately in the checkpoint files.
-    current_abundance_summary_file: str = "ASF_Current_Abundance_Results_GJ205.txt"
-    current_abundance_chi2_file: str = "ASF_Current_Abundance_Chi2_GJ205.txt"
-    current_abundance_line_error_file: str = "ASF_Current_Abundance_Line_Errors_GJ205.txt"
-    current_parameter_chi2_file: str = "ASF_Current_Parameter_Chi2_GJ205.txt"
-    current_parameter_line_result_file: str = "ASF_Current_Parameter_Line_Results_GJ205.txt"
-    current_parameter_summary_file: str = "ASF_Current_Parameter_Results_GJ205.txt"
-    iteration_log_file: str = "ASF_Run_Notes_GJ205.txt"
+    current_abundance_summary_file: str = "ASF_Current_Abundance_Results_GJ205_SW_NoCr_AlphaFree.txt"
+    current_abundance_chi2_file: str = "ASF_Current_Abundance_Chi2_GJ205_SW_NoCr_AlphaFree.txt"
+    current_abundance_line_error_file: str = "ASF_Current_Abundance_Line_Errors_GJ205_SW_NoCr_AlphaFree.txt"
+    current_parameter_chi2_file: str = "ASF_Current_Parameter_Chi2_GJ205_SW_NoCr_AlphaFree.txt"
+    current_parameter_line_result_file: str = "ASF_Current_Parameter_Line_Results_GJ205_SW_NoCr_AlphaFree.txt"
+    current_parameter_summary_file: str = "ASF_Current_Parameter_Results_GJ205_SW_NoCr_AlphaFree.txt"
+    iteration_log_file: str = "ASF_Run_Notes_GJ205_SW_NoCr_AlphaFree.txt"
 
     # Final science tables.
-    final_abundance_file: str = "ASF_Final_Elemental_Abundances_GJ205.txt"
-    final_parameter_file: str = "ASF_Final_Stellar_Parameters_GJ205.txt"
+    final_abundance_file: str = "ASF_Final_Elemental_Abundances_GJ205_SW_NoCr_AlphaFree.txt"
+    final_parameter_file: str = "ASF_Final_Stellar_Parameters_GJ205_SW_NoCr_AlphaFree.txt"
 
     # ------------------------------------------------------------------
     # Turbospectrum model naming and execution
@@ -389,12 +402,12 @@ class AutoSpecFitConfig:
     # User-supplied bash script used to execute Turbospectrum and generate
     # the synthetic spectra required by ASF.
     # Default Turbospectrum runner for interpolated MARCS atmospheres.
-    turbospectrum_runner: Optional[str] = "./run_TS_Interpolated_Model_H_band_apogee.sh"
+    turbospectrum_runner: Optional[str] = "./run_TS_Interpolated_Model_H_band_apogee_GJ205.sh"
 
     # Turbospectrum runner for atmosphere combinations that exist directly in
     # the MARCS grid and therefore do not require atmospheric interpolation.
     turbospectrum_noninterpolated_runner: Optional[str] = (
-        "./run_TS_NonInterpolated_Model_H_band_apogee.sh"
+        "./run_TS_NonInterpolated_Model_H_band_apogee_GJ205.sh"
     )
 
     # Optional execution prefix used on HPC systems. The default reproduces
@@ -424,7 +437,7 @@ class AutoSpecFitConfig:
     # over this grid, while the abundances of all other elements are fixed to
     # the species-level mean abundances determined in the previous iteration.
     #
-    # The default grid spans -0.400 to +0.400 dex in steps of 0.020 dex. Users may
+    # The abundance grid spans -0.350 to +0.350 dex in steps of 0.020 dex. Users may
     # freely modify both the abundance range and the grid spacing depending on
     # their scientific goals and computational resources.
     #
@@ -437,14 +450,14 @@ class AutoSpecFitConfig:
     #
     # Users should ensure that the abundance range is sufficiently broad so
     # that the chi-square minimum does not occur near the grid boundaries.
-    abundance_values: Tuple[float, ...] = tuple(np.round(np.arange(-0.400, 0.401, 0.020), 3))
+    abundance_values: Tuple[float, ...] = tuple(np.round(np.arange(-0.350, 0.351, 0.020), 3))
 
     # ------------------------------------------------------------------
     # Iteration and convergence settings
     # ------------------------------------------------------------------
 
-    # The first abundance iteration is run separately. This value gives the
-    # number of additional iterations after iteration 1. The default value of
+    # Abundance iteration 1 is run with the initial adopted atmosphere. This value gives the
+    # number of additional abundance iterations after iteration 1. The default value of
     # 14 gives a maximum of 15 total abundance iterations, limiting the
     # computational load on shared HPC systems.
     n_followup_iterations: int = 14
@@ -477,8 +490,8 @@ class AutoSpecFitConfig:
     # Sequential stellar-parameter refinement
     # ------------------------------------------------------------------
 
-    # Run one-dimensional atmospheric-parameter refinement after each
-    # completed abundance iteration. Only one parameter varies in each sub-step.
+    # Run atmospheric-parameter refinement after abundance iteration 1 and
+    # again after each completed abundance iteration that requires another cycle. Only one parameter varies in each sub-step.
     #
     # The general ASF v2.0 ordering strategy is:
     #   1. Fit vmic first using all selected parameter lines.
@@ -487,8 +500,8 @@ class AutoSpecFitConfig:
     #      earlier. If no suitable diagnostic subset is available for one of
     #      these parameters, place it last among the three and fit it using all
     #      selected parameter lines.
-    # [alpha/Fe] remains fixed at its original input value throughout both
-    # passes and all abundance iterations.
+    # [alpha/Fe] is a free fitted parameter and is determined last in each pass
+    # using the available selected alpha-element lines.
     #
     # The example configuration below uses the order encoded by the calls in the
     # target-specific refiner and can be adapted for other targets.
@@ -497,6 +510,9 @@ class AutoSpecFitConfig:
     # File containing all parameter-diagnostic lines. Expected columns:
     # Line_num Species line_center RV min_fit max_fit
     parameter_line_file: Path = Path("All_Species_Fit_Ranges_GJ205.txt")
+    metallicity_sensitivity_file: Path = SCRIPT_DIR / "GJ205_Metal_Sensitivity_MetalMin-0.40_MetalMax+0.40_Teff3700_Grav+4.7.txt"
+    logg_sensitivity_file: Path = SCRIPT_DIR / "GJ205_Logg_Sensitivity_GravMin+4.5_GravMax+5.5_Teff3700_Metal+0.10.txt"
+    teff_sensitivity_file: Path = SCRIPT_DIR / "GJ205_Teff_Sensitivity_TeffMin3500_TeffMax3900_Metal+0.10_Grav+4.7.txt"
 
     # Example Pass-1 diagnostic-line selections (1-based, matching
     # parameter_line_file). For general use, define parameter-specific subsets
@@ -505,8 +521,8 @@ class AutoSpecFitConfig:
     # the full selected parameter-line list and place that parameter last among
     # [M/H], log g, and Teff. The values below are the supplied example settings.
     metallicity_diagnostic_lines: Tuple[int, ...] = (12, 13, 65, 66, 68)
-    logg_diagnostic_lines: Tuple[int, ...] = (4, 48, 55, 65, 66, 68, 98)
-    teff_diagnostic_lines: Tuple[int, ...] = tuple(range(1, 99))
+    logg_diagnostic_lines: Tuple[int, ...] = (65, 66, 68)
+    teff_diagnostic_lines: Tuple[int, ...] = (1, 2, 3, 22, 48, 49, 52, 53, 55, 97)
 
     # vmic is fitted with every line listed in parameter_line_file in both
     # parameter passes.
@@ -514,11 +530,10 @@ class AutoSpecFitConfig:
         0.00, 0.20, 0.40, 0.60, 0.80, 1.00, 1.20, 1.40
     )
 
-    # Alpha-element membership is used only to convert native ASF offsets to
-    # physical [X/H]. [alpha/Fe] itself is fixed, not fitted.
+    # Alpha-element membership defines the lines used to fit [alpha/Fe] and is
+    # also used to convert native ASF offsets to physical [X/H].
     alpha_species: Tuple[str, ...] = ("O", "OH", "Mg", "Ca", "Ti")
-    # Allowed atmosphere-grid values used to canonicalize the fixed input
-    # [alpha/Fe] value and construct Turbospectrum model filenames.
+    # Pass-1 [alpha/Fe] grid and allowed model-atmosphere values.
     alpha_values: Tuple[float, ...] = (
         -0.20, -0.10, 0.00, 0.10, 0.20, 0.30, 0.40
     )
@@ -526,7 +541,7 @@ class AutoSpecFitConfig:
     # Pass-1/original parameter grids.  The min/max/step settings below define
     # the actual Teff, log g, and [M/H] grids used by the fitting routine and by
     # Turbospectrum/model filenames. vmic uses its explicit value tuple above;
-    # the fixed [alpha/Fe] input is canonicalized against alpha_values.
+    # the fitted [alpha/Fe] input is canonicalized against alpha_values.
     teff_min: float = 3500.0
     teff_max: float = 3900.0
     teff_step: float = 50.0
@@ -537,22 +552,31 @@ class AutoSpecFitConfig:
     metallicity_max: float = +0.40
     metallicity_step: float = 0.10
 
-    # Pass-2 local-grid step sizes.  Each value must equal the spacing of the
-    # corresponding Pass-1/original grid.  Pass 2 always uses five existing
-    # Pass-1 grid points and shifts that five-point window inward near an edge;
-    # it never creates trial values outside the Pass-1 grid.
+    # Hard physical/synthesis limits retained as global validation bounds.
+    # Pass-2 trial grids themselves remain strictly within the selected Pass-1 grids.
+    hard_teff_min: float = 3000.0
+    hard_teff_max: float = 3900.0
+    hard_logg_min: float = 4.50
+    hard_logg_max: float = 5.50
+    hard_metallicity_min: float = -1.00
+    hard_metallicity_max: float = +0.50
+
+    # Pass-2 local-grid step sizes. Each value must equal the spacing of the
+    # corresponding Pass-1/original grid. Pass 2 uses the existing Pass-1 grid
+    # points within two steps of the rounded Pass-1 solution: five points in
+    # the interior, four one step from a boundary, and three at a boundary.
     second_pass_vmic_half_width: float = 0.20
     second_pass_metallicity_half_width: float = 0.10
     second_pass_logg_half_width: float = 0.10
     second_pass_teff_half_width: float = 50.0
+    second_pass_alpha_half_width: float = 0.10
 
-    # Cumulative user-facing history tables are written vertically. The legacy
-    # row-style parameter-history filename is retained ONLY so older checkpoints
-    # can be migrated; new runs do not append to that legacy file.
-    abundance_history_file: str = "ASF_Abundance_History_GJ205.txt"
-    parameter_history_file: str = "ASF_Parameter_History_GJ205.txt"
-    convergence_history_file: str = "ASF_Convergence_History_GJ205.txt"
-    legacy_parameter_history_file: str = "ASF_Stellar_Parameter_History_GJ205.txt"
+    # Cumulative history tables. The legacy row-style parameter history is kept
+    # for restart compatibility with older runs produced by this example setup.
+    abundance_history_file: str = "ASF_Abundance_History_GJ205_SW_NoCr_AlphaFree.txt"
+    parameter_history_file: str = "ASF_Parameter_History_GJ205_SW_NoCr_AlphaFree.txt"
+    convergence_history_file: str = "ASF_Convergence_History_GJ205_SW_NoCr_AlphaFree.txt"
+    legacy_parameter_history_file: str = "ASF_Stellar_Parameter_History_GJ205_SW_NoCr_AlphaFree.txt"
 
     # ------------------------------------------------------------------
     # Restart/checkpoint files
@@ -562,19 +586,45 @@ class AutoSpecFitConfig:
     # If the program is restarted and this file exists, the pipeline resumes
     # from the next unfinished stage rather than starting again at iteration 1.
     resume_from_checkpoint: bool = True
-    checkpoint_file: str = "ASF_Restart_Checkpoint_GJ205.txt"
-    parameter_progress_file: str = "ASF_Parameter_Progress_GJ205.txt"
+    checkpoint_file: str = "ASF_Restart_Checkpoint_GJ205_SW_NoCr_AlphaFree.txt"
+    parameter_progress_file: str = "ASF_Parameter_Progress_GJ205_SW_NoCr_AlphaFree.txt"
     # One-time fresh-start marker. If absent, ASF clears any old restart
     # files and begins from abundance iteration 1. The marker is then created,
     # so any later relaunch after a crash resumes from the new checkpoints.
-    fresh_start_marker_file: str = "ASF_Fresh_Start_Initialized_GJ205.txt"
+    fresh_start_marker_file: str = "ASF_Fresh_Start_Initialized_GJ205_SW_NoCr_AlphaFree.txt"
 
-    # Changes smaller than/equal to these values are treated as parameter
-    # convergence between consecutive abundance/parameter cycles.
+    # One-grid-step atmospheric-parameter convergence tolerances. For parameter
+    # iterations 2--5, every fitted parameter must remain within one step. From
+    # iteration 6 onward, at most one fitted parameter may exceed one step, but
+    # that single change must remain within two steps.
     teff_convergence_tolerance: float = 50.0
     logg_convergence_tolerance: float = 0.10
     metallicity_convergence_tolerance: float = 0.10
     vmic_convergence_tolerance: float = 0.20  # convergence requires |Delta vmic| <= 0.20 km/s
+    alpha_convergence_tolerance: float = 0.10
+
+    # ------------------------------------------------------------------
+    # Optional one-time restart/rewind support
+    # ------------------------------------------------------------------
+    # Set to an iteration number only when intentionally rewinding an existing
+    # checkpointed run. Keep None for a normal fresh/resumed GJ 205 analysis.
+    restart_from_iteration_once: Optional[int] = None
+    restart_from_iteration_marker_file: str = "ASF_Restart_From_Iteration_Applied_GJ205_SW_NoCr_AlphaFree.txt"
+
+    # ------------------------------------------------------------------
+    # Diagnostic-consistency safeguard
+    # ------------------------------------------------------------------
+    # Protect against a Pass-1 parameter update that moves substantially while
+    # its parameter-specific diagnostic lines become markedly less mutually
+    # consistent than in the preceding parameter iteration. start_iteration=1
+    # enables the mechanism from the beginning; iteration 1 establishes the
+    # first baseline because no earlier diagnostic scatter exists.
+    diagnostic_consistency_guard_enabled: bool = True
+    diagnostic_consistency_guard_start_iteration: int = 1
+    diagnostic_consistency_min_shift_steps: float = 1.0
+    diagnostic_consistency_scatter_ratio: float = 3.0
+    diagnostic_consistency_min_current_scatter_steps: float = 1.0
+    diagnostic_consistency_history_file: str = "ASF_Parameter_Diagnostic_Consistency_GJ205_SW_NoCr_AlphaFree.txt"
 
     # ------------------------------------------------------------------
     # AutoSpecNorm and model-smoothing settings
@@ -613,14 +663,14 @@ class AutoSpecFitConfig:
     parabolic_fit_half_width: float = 0.10
 
     # Abundance rejection limits.
-    # OH line abundances are accepted only when
-    # -0.250 < A(OH) < +0.250 dex.
-    # For every other species, reject only line abundances equal to
-    # -0.360, -0.350, +0.350, or +0.360 dex.
+    # OH line abundances are accepted when
+    # -0.300 <= A(OH) <= +0.300 dex; values outside this interval are rejected.
+    # For every other species, reject only abundances exactly at the
+    # abundance-grid endpoints (-0.350 and +0.350 dex).
     oh_lower_rejection_limit: float = -0.300
     oh_upper_rejection_limit: float = +0.300
     generic_rejected_abundances: Tuple[float, ...] = (
-        -0.360, -0.350, +0.350, +0.360
+        -0.350, +0.350
     )
     abundance_edge_tolerance: float = 1.0e-8
 
@@ -866,7 +916,7 @@ def write_species_mean_table(
     random_errors: np.ndarray,
     config: AutoSpecFitConfig,
 ) -> None:
-    """Overwrite the rolling species summary with the newest native ASF-offset results."""
+    """Overwrite the rolling species summary with the newest abundance results."""
     output_path = Path(config.output_dir) / config.current_abundance_summary_file
     table = pd.DataFrame({
         "Element": species.element_names,
@@ -892,7 +942,7 @@ def convert_asf_offsets_to_xh(
 
         non-alpha elements: [X/H] = ASF(X) + [M/H]_final
         alpha elements:     [X/H] = ASF(X) + [M/H]_final
-                                      + [alpha/Fe]_fixed
+                                      + [alpha/Fe]_final
 
     ``config.alpha_species`` is defined in terms of spectral species and may
     contain ``OH``; for the elemental output table OH therefore maps to O.
@@ -930,9 +980,10 @@ def write_final_abundance_table(
     """Save final [X/H] abundances with random, systematic, and total errors.
 
     ``final_not_rounded`` and ``final_rounded`` are the native ASF abundance
-    offsets from the final iterative abundance fit.  The science abundance
+    offsets from the dedicated final abundance-only fit at the accepted atmosphere.
+    The science abundance
     reported here is converted to [X/H] with the final fitted [M/H] and, for
-    alpha elements, the fixed input [alpha/Fe]. The native ASF offset is kept
+    alpha elements, the final fitted [alpha/Fe]. The native ASF offset is kept
     as a separate column for traceability.
 
     The random abundance error is unchanged by adding fixed nominal atmospheric
@@ -968,6 +1019,10 @@ def write_final_abundance_table(
         per_parameter_systematics.get("teff", np.full_like(random_errors, np.nan)),
         dtype=float,
     )
+    systematic_alpha = np.asarray(
+        per_parameter_systematics.get("alpha", np.full_like(random_errors, np.nan)),
+        dtype=float,
+    )
 
     final_xh_not_rounded = convert_asf_offsets_to_xh(
         final_not_rounded, final_stellar_parameters, species, config
@@ -984,6 +1039,7 @@ def write_final_abundance_table(
             "Systematic_M_H": systematic_metallicity,
             "Systematic_logg": systematic_logg,
             "Systematic_Teff": systematic_teff,
+            "Systematic_alpha_Fe": systematic_alpha,
             "Final_Systematic_Error": systematic_errors,
             "Final_Total_Error": total_errors,
         }
@@ -994,11 +1050,11 @@ def write_final_abundance_table(
             f"# Final atmosphere: [M/H]={float(final_stellar_parameters.metallicity):+.2f}, "
             f"[alpha/Fe]={float(final_stellar_parameters.alpha):+.2f}\n"
             "# Non-alpha: [X/H] = ASF_Offset + [M/H]_final\n"
-            "# Alpha:     [X/H] = ASF_Offset + [M/H]_final + [alpha/Fe]_fixed\n"
+            "# Alpha:     [X/H] = ASF_Offset + [M/H]_final + [alpha/Fe]_final\n"
             "# Random error is unchanged by the abundance-scale conversion.\n"
             "# Per-parameter systematic columns are the mean absolute, linearly scaled +/-1-sigma [X/H] shifts.\n"
-            "# Fixed [alpha/Fe] is not varied and does not contribute to the systematic error.\n"
-            "# Final_Systematic_Error is the quadrature sum of the four per-parameter systematic columns.\n"
+            "# Fitted [alpha/Fe] is varied by its final 1-sigma uncertainty and contributes to the systematic error.\n"
+            "# Final_Systematic_Error is the quadrature sum of the five per-parameter systematic columns.\n"
             "# Total error = sqrt(Random_Error^2 + Systematic_Error^2)\n"
         )
         if convergence_summary:
@@ -1780,14 +1836,14 @@ def compute_line_chi2_curve(
         chi2_curve[abundance_index] = chi2_value
         valid_abundances.append(abundances[abundance_index])
 
-        chi2_context = (
-            f"ABUNDANCE ITERATION {iteration_id}"
-            if log_context is None
-            else log_context
-        )
+        if log_context is None:
+            chi2_context = f"ABUNDANCE ITERATION {iteration_id}"
+        else:
+            chi2_context = log_context
+
         LOGGER.info(
             "CHI2 | %s | ELEMENT %s | line %.3f | "
-            "grid %d/%d | abundance %+.3f | chi2=%.6e",
+            "grid %d/%d | ASF_offset %+.3f | chi2=%.6e",
             chi2_context,
             element_name,
             line_center,
@@ -1824,14 +1880,14 @@ def reject_edge_or_known_outlier_lines(
     valid = np.isfinite(line_abundances)
 
     if species_index == 0:
-        # Preserve the established OH rejection interval.
+        # Reject OH only outside the configured inclusive interval.
         abundance_mask = (
-            (line_abundances > config.oh_lower_rejection_limit)
-            & (line_abundances < config.oh_upper_rejection_limit)
+            (line_abundances >= config.oh_lower_rejection_limit)
+            & (line_abundances <= config.oh_upper_rejection_limit)
         )
     else:
-        # For all other species, reject only:
-        # -0.360, -0.350, +0.350, +0.360 dex.
+        # For all other species, reject only the abundance-grid endpoints.
+        # Interior values are retained.
         rejected = np.zeros_like(line_abundances, dtype=bool)
         for rejected_value in config.generic_rejected_abundances:
             rejected |= np.isclose(
@@ -1950,7 +2006,7 @@ def fit_species_in_iteration(
     """
     species_name = species.species_names[species_index]
     element_name = species.element_names[species_index]
-    LOGGER.info("Iteration %d | fitting %s (%d lines)", iteration_id, species_name, line_list.n_lines)
+    LOGGER.info("%s | fitting %s (%d lines)", (log_context if log_context is not None else f"ABUNDANCE ITERATION {iteration_id}"), species_name, line_list.n_lines)
 
     if log_handle is not None:
         log_handle.write(f"{element_name}\n")
@@ -2003,7 +2059,7 @@ def fit_species_in_iteration(
 
     clipped, mean, rounded_mean = combine_species_line_abundances(line_results, species_index, config)
     LOGGER.info(
-        "Iteration %d | %s mean abundance = %.3f from %d clipped/accepted lines",
+        "Iteration %d | %s mean ASF offset = %.3f from %d clipped/accepted lines",
         iteration_id,
         species_name,
         rounded_mean,
@@ -2041,6 +2097,8 @@ def run_iteration(
     expected synthetic spectra, fit all selected lines for all species, write
     diagnostic output files, and return the species-level abundance results.
     """
+    iteration_start_time = time.perf_counter()
+    LOGGER.info("ABUNDANCE ITERATION TIMER START | iteration=%d", iteration_id)
     run_ts_this_iteration = config.run_ts_by_iteration.get(iteration_id, config.run_turbospectrum)
     missing_before_submission = require_models_or_ts_enabled(
         model_paths,
@@ -2127,6 +2185,10 @@ def run_iteration(
         iteration_id, species, mean_abundances, random_errors, config
     )
 
+    LOGGER.info(
+        "ABUNDANCE ITERATION TIMER END | iteration=%d | elapsed=%s",
+        iteration_id, _format_elapsed(time.perf_counter() - iteration_start_time),
+    )
     return species_results
 
 
@@ -2137,29 +2199,45 @@ def evaluate_convergence_status(
 ) -> Tuple[bool, List[int], float, str]:
     """Evaluate staged ASF abundance convergence for the current iteration.
 
-    Reported tolerances are 0.05, 0.08, and 0.10 dex. The 0.0049 dex
-    comparison margin is applied only internally.
+    Reported tolerances are the nominal scientific tolerances (0.05, 0.08,
+    and 0.10 dex).  A 0.0049 dex comparison margin is applied internally so
+    that values which round to the nominal tolerance are not rejected solely
+    because of numerical/rounding effects.
 
-    Iterations 2-5: all finite species must satisfy 0.05 dex.
-    Iterations 6-8: at most one finite species may exceed 0.05 dex.
-    Iterations 9-12: at most two finite species may exceed 0.08 dex, and
-                     at most one finite species may exceed 0.10 dex.
-    Iterations 13-15: at most two finite species may exceed 0.10 dex, with
-                      no additional upper-change restriction on those two.
+    Rules
+    -----
+    Iterations 2-5
+        All finite species must satisfy |Delta abundance| <= 0.05 dex.
 
-    NaN/non-finite changes are ignored for convergence counting.
+    Iterations 6-8
+        The tolerance remains 0.05 dex and at most one finite species may
+        remain above it.
+
+    Iterations 9-12
+        The tolerance is 0.08 dex. At most two finite species may remain above
+        it, and at most one finite species may exceed 0.10 dex.
+
+    Iterations 13-15
+        The tolerance is 0.10 dex. At most two finite species may remain above
+        it, with no additional upper-change restriction on those two species.
+
+    Species above the active tolerance are returned in
+    ``non_converged_indices`` so that the existing late-history median
+    treatment can be applied at finalization. NaN changes are ignored for
+    convergence counting.
     """
     change = np.asarray(change, dtype=float)
     finite = np.isfinite(change)
-    comparison_epsilon = ABUNDANCE_CONVERGENCE_MARGIN
+    comparison_epsilon = 0.0049
 
     if iteration_id < config.intermediate_convergence_start_iteration:
         active_tolerance = config.early_convergence_tolerance
         non_converged_indices = np.where(
             finite & (change > active_tolerance + comparison_epsilon)
         )[0].astype(int).tolist()
+        converged = len(non_converged_indices) == 0
         return (
-            len(non_converged_indices) == 0,
+            converged,
             non_converged_indices,
             active_tolerance,
             "strict early convergence",
@@ -2170,8 +2248,9 @@ def evaluate_convergence_status(
         non_converged_indices = np.where(
             finite & (change > active_tolerance + comparison_epsilon)
         )[0].astype(int).tolist()
+        converged = len(non_converged_indices) <= 1
         return (
-            len(non_converged_indices) <= 1,
+            converged,
             non_converged_indices,
             active_tolerance,
             "intermediate convergence",
@@ -2183,16 +2262,14 @@ def evaluate_convergence_status(
             finite & (change > active_tolerance + comparison_epsilon)
         )[0].astype(int).tolist()
         n_above_010 = int(
-            np.sum(
-                finite
-                & (
-                    change
-                    > config.final_convergence_tolerance + comparison_epsilon
-                )
-            )
+            np.sum(finite & (change > config.final_convergence_tolerance + comparison_epsilon))
+        )
+        converged = (
+            len(non_converged_indices) <= 2
+            and n_above_010 <= 1
         )
         return (
-            len(non_converged_indices) <= 2 and n_above_010 <= 1,
+            converged,
             non_converged_indices,
             active_tolerance,
             "late convergence",
@@ -2202,8 +2279,9 @@ def evaluate_convergence_status(
     non_converged_indices = np.where(
         finite & (change > active_tolerance + comparison_epsilon)
     )[0].astype(int).tolist()
+    converged = len(non_converged_indices) <= 2
     return (
-        len(non_converged_indices) <= 2,
+        converged,
         non_converged_indices,
         active_tolerance,
         "final-stage convergence",
@@ -2352,8 +2430,10 @@ def save_restart_checkpoint(
 
     next_stage values:
         "abundance"   -> run abundance iteration ``iteration_id`` next
-        "parameter"   -> run parameter cycle after abundance iteration ``iteration_id``
-        "convergence" -> abundance + parameter work for ``iteration_id`` is complete;
+        "parameter"   -> use abundance iteration ``iteration_id`` to derive parameter
+                         iteration ``iteration_id + 1``
+        "convergence" -> abundance iteration ``iteration_id`` is complete and was
+                         evaluated with parameter iteration ``iteration_id``;
                          only convergence/finalization remains
         "finished"    -> final products were written
     """
@@ -2410,7 +2490,11 @@ def initialize_fresh_start_once(config: AutoSpecFitConfig) -> None:
     if marker_path.exists():
         return
 
-    for filename in (config.checkpoint_file, config.parameter_progress_file):
+    for filename in (
+        config.checkpoint_file,
+        config.parameter_progress_file,
+        config.diagnostic_consistency_history_file,
+    ):
         path = Path(config.output_dir) / filename
         if path.exists():
             path.unlink()
@@ -2489,6 +2573,187 @@ def load_restart_checkpoint(
     return payload
 
 
+def _read_parameter_history_iteration_state(
+    path: Path,
+    iteration_id: int,
+) -> Tuple[StellarParameters, Dict[str, float], Dict[str, float], Dict[str, float]]:
+    """Restore one complete parameter-iteration state from the vertical history file."""
+    blocks = _read_vertical_history_blocks(Path(path))
+    block = blocks.get(int(iteration_id), [])
+    if not block:
+        raise RuntimeError(
+            f"Cannot restart from iteration {iteration_id}: parameter-history block is missing in {path}."
+        )
+
+    label_to_key = {
+        "Teff": "teff",
+        "logg": "logg",
+        "[M/H]": "metallicity",
+        "[alpha/Fe]": "alpha",
+        "vmic": "vmic",
+    }
+    real_values: Dict[str, float] = {}
+    rounded_values: Dict[str, float] = {}
+    errors: Dict[str, float] = {}
+    shifts: Dict[str, float] = {}
+
+    for line in block:
+        parts = line.split()
+        if len(parts) < 5 or parts[0] not in label_to_key:
+            continue
+        key = label_to_key[parts[0]]
+        try:
+            real_values[key] = float(parts[1])
+            rounded_values[key] = float(parts[2])
+            errors[key] = float(parts[3])
+            shifts[key] = float(parts[4])
+        except (TypeError, ValueError):
+            continue
+
+    required = ("teff", "logg", "metallicity", "alpha", "vmic")
+    missing = [key for key in required if key not in rounded_values]
+    if missing:
+        raise RuntimeError(
+            f"Cannot restart from iteration {iteration_id}: missing parameter values {missing} in {path}."
+        )
+
+    params = StellarParameters(
+        teff=format_parameter_value("teff", rounded_values["teff"]),
+        logg=format_parameter_value("logg", rounded_values["logg"]),
+        metallicity=format_parameter_value("metallicity", rounded_values["metallicity"]),
+        alpha=format_parameter_value("alpha", rounded_values["alpha"]),
+        vmic=format_parameter_value("vmic", rounded_values["vmic"]),
+    )
+    return params, real_values, errors, shifts
+
+
+def apply_one_time_iteration_rewind(
+    config: AutoSpecFitConfig,
+    checkpoint: Optional[Dict],
+    species: SpeciesConfig,
+) -> Optional[Dict]:
+    """Rewind an existing checkpoint once so a chosen abundance iteration is rerun."""
+    target = config.restart_from_iteration_once
+    if target is None:
+        return checkpoint
+
+    target = int(target)
+    marker_path = Path(config.output_dir) / config.restart_from_iteration_marker_file
+    if marker_path.exists():
+        return checkpoint
+
+    if checkpoint is None:
+        raise RuntimeError(
+            f"restart_from_iteration_once={target} requires an existing restart checkpoint. "
+            "No checkpoint was found, so ASF will not guess the earlier run state."
+        )
+    if target < 2 or target > checkpoint["mean_history_array"].shape[1]:
+        raise ValueError(f"Invalid restart_from_iteration_once={target}.")
+
+    # To restart *from* iteration N consistently, restore parameter iteration N-1
+    # and rerun the parameter refinement that creates parameter iteration N.
+    # This ensures the newly restricted grid is already applied to P_N before A_N.
+    source_parameter_iteration = target - 1
+    parameter_history_path = Path(config.output_dir) / config.parameter_history_file
+    params, real_values, errors, shifts = _read_parameter_history_iteration_state(
+        parameter_history_path, source_parameter_iteration
+    )
+    params = round_all_stellar_parameters_to_grids(config, params)
+
+    mean_history = np.asarray(checkpoint["mean_history_array"], dtype=float).copy()
+    rounded_history = np.asarray(checkpoint["rounded_history_array"], dtype=float).copy()
+    # Keep iterations 1..target-1.  The requested iteration and everything after it
+    # will be recomputed under the new parameter grid.
+    mean_history[:, target - 1 :] = np.nan
+    rounded_history[:, target - 1 :] = np.nan
+
+    # Remove stale cumulative-history blocks at the restart iteration and later.
+    # Iterations before the target are preserved exactly; target and later blocks
+    # are rebuilt as the rerun progresses.
+    history_specs = [
+        (config.abundance_history_file, [
+            "# Cumulative elemental ASF-offset history for GJ205",
+            "# Each iteration is listed below the previous iteration; values are native ASF offsets (dex).",
+            "# Parameter iteration N is the atmosphere used by abundance iteration N; no extra abundance iteration is added after convergence.",
+        ]),
+        (config.parameter_history_file, [
+            "# Cumulative atmospheric-parameter history for GJ205",
+            "# Each iteration is listed below the previous iteration; values are native ASF offsets (dex).",
+            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and absolute Pass-1-to-Pass-2 refinement shift.",
+        ]),
+        (config.convergence_history_file, [
+            "# Cumulative combined convergence history for GJ205",
+            "# Each completed iterative convergence check is listed vertically below the previous check.",
+            "# Each block contains BOTH elemental-abundance and atmospheric-parameter changes.",
+            "# Parameter iteration N is the atmosphere used by abundance iteration N; therefore the",
+            "# convergence check at iteration N compares parameter iterations N-1 and N.",
+            "# Overall convergence is satisfied only when BOTH abundance and atmospheric-parameter criteria are satisfied.",
+            "# Maximum-iteration finalization is explicitly reported and is NOT labeled as convergence.",
+        ]),
+    ]
+    for filename, header_lines in history_specs:
+        history_path = Path(config.output_dir) / filename
+        blocks = _read_vertical_history_blocks(history_path)
+        if blocks:
+            blocks = {k: v for k, v in blocks.items() if int(k) < target}
+            _write_vertical_history_blocks(history_path, header_lines, blocks)
+
+    diagnostic_history = _load_diagnostic_consistency_history(config)
+    if diagnostic_history:
+        for key, series in diagnostic_history.items():
+            diagnostic_history[key] = {
+                k: v for k, v in series.items() if int(k) < target
+            }
+        _save_diagnostic_consistency_history(config, diagnostic_history)
+
+    # Rolling and final products describe only the newest stage/final solution.
+    # Remove stale copies from the pre-rewind run; they will be recreated by the
+    # rerun beginning with parameter iteration N and abundance iteration N.
+    stale_products = [
+        config.current_abundance_summary_file,
+        config.current_abundance_chi2_file,
+        config.current_abundance_line_error_file,
+        config.current_parameter_chi2_file,
+        config.current_parameter_line_result_file,
+        config.current_parameter_summary_file,
+        config.final_abundance_file,
+        config.final_parameter_file,
+    ]
+    for filename in stale_products:
+        stale_path = Path(config.output_dir) / filename
+        if stale_path.exists():
+            stale_path.unlink()
+
+    checkpoint["next_stage"] = "parameter"
+    checkpoint["iteration_id"] = source_parameter_iteration
+    checkpoint["current_stellar_parameters"] = stellar_parameters_to_dict(params)
+    checkpoint["mean_history_array"] = mean_history
+    checkpoint["rounded_history_array"] = rounded_history
+    checkpoint["mean_history"] = mean_history.tolist()
+    checkpoint["rounded_history"] = rounded_history.tolist()
+    checkpoint["parameter_errors_dict"] = errors
+    checkpoint["real_parameter_values_dict"] = real_values
+    checkpoint["parameter_consistency_shifts_dict"] = shifts
+    checkpoint["abundance_errors_array"] = np.full(species.n_species, np.nan)
+    checkpoint["abundance_errors"] = [None] * species.n_species
+    checkpoint["parameter_converged_for_next_iteration"] = True
+
+    clear_parameter_progress(config)
+    with open(marker_path, "w") as handle:
+        handle.write(
+            f"One-time ASF rewind applied: parameter iteration {target} and abundance iteration {target} will be rerun.\n"
+        )
+
+    LOGGER.warning(
+        "One-time restart override applied: restoring parameter iteration %d and "
+        "rerunning parameter iteration %d before abundance iteration %d.",
+        source_parameter_iteration,
+        target,
+        target,
+    )
+    return checkpoint
+
+
 def save_parameter_progress(
     config: AutoSpecFitConfig,
     *,
@@ -2501,7 +2766,7 @@ def save_parameter_progress(
     parameter_consistency_shifts: Optional[Dict[str, float]] = None,
     first_pass_real_values: Optional[Dict[str, float]] = None,
 ) -> None:
-    """Checkpoint the sequential [M/H] -> log g -> Teff refinement."""
+    """Checkpoint the sequential vmic -> [M/H] -> log g -> Teff refinement."""
     payload = {
         "version": 1,
         "iteration_id": int(iteration_id),
@@ -2613,26 +2878,53 @@ def parameter_change_is_converged(
     old_parameters: StellarParameters,
     new_parameters: StellarParameters,
     config: AutoSpecFitConfig,
+    iteration_id: Optional[int] = None,
 ) -> bool:
-    """Return True when all four fitted atmospheric parameters are stable."""
+    """Evaluate atmospheric-parameter convergence between consecutive cycles.
+
+    For parameter iterations 2--5, all five fitted parameters must change by no
+    more than one adopted grid step.  From parameter iteration 6 onward, at most
+    one parameter may change by more than one grid step, provided that its change
+    is no greater than two grid steps and every other parameter remains within
+    one grid step.
+    """
     try:
-        d_teff = abs(float(new_parameters.teff) - float(old_parameters.teff))
-        d_logg = abs(float(new_parameters.logg) - float(old_parameters.logg))
-        d_metallicity = abs(float(new_parameters.metallicity) - float(old_parameters.metallicity))
-        d_vmic = abs(float(new_parameters.vmic) - float(old_parameters.vmic))
+        changes = np.asarray([
+            abs(float(new_parameters.teff) - float(old_parameters.teff)),
+            abs(float(new_parameters.logg) - float(old_parameters.logg)),
+            abs(float(new_parameters.metallicity) - float(old_parameters.metallicity)),
+            abs(float(new_parameters.vmic) - float(old_parameters.vmic)),
+            abs(float(new_parameters.alpha) - float(old_parameters.alpha)),
+        ], dtype=float)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "StellarParameters.teff, logg, metallicity, and vmic must be "
+            "StellarParameters.teff, logg, metallicity, vmic, and alpha must be "
             "numeric strings when iterative parameter refinement is enabled."
         ) from exc
 
+    one_step = np.asarray([
+        config.teff_convergence_tolerance,
+        config.logg_convergence_tolerance,
+        config.metallicity_convergence_tolerance,
+        config.vmic_convergence_tolerance,
+        config.alpha_convergence_tolerance,
+    ], dtype=float)
     comparison_epsilon = 1.0e-10
-    return (
-        d_teff <= (config.teff_convergence_tolerance + comparison_epsilon)
-        and d_logg <= (config.logg_convergence_tolerance + comparison_epsilon)
-        and d_metallicity <= (config.metallicity_convergence_tolerance + comparison_epsilon)
-        and d_vmic <= (config.vmic_convergence_tolerance + comparison_epsilon)
-    )
+
+    within_one = changes <= (one_step + comparison_epsilon)
+    if iteration_id is None or int(iteration_id) < 6:
+        return bool(np.all(within_one))
+
+    above_one = ~within_one
+    if int(np.sum(above_one)) == 0:
+        return True
+    if int(np.sum(above_one)) > 1:
+        return False
+
+    # From iteration 6 onward, the single parameter outside one grid step may
+    # move by at most two grid steps (e.g. log g 5.2 -> 5.4 for a 0.1-dex grid).
+    idx = int(np.where(above_one)[0][0])
+    return bool(changes[idx] <= (2.0 * one_step[idx] + comparison_epsilon))
 
 
 def write_parameter_history_row(
@@ -2782,8 +3074,9 @@ def update_abundance_history_table(
     _write_vertical_history_blocks(
         path,
         [
-            "# Cumulative elemental-abundance history",
+            "# Cumulative elemental-abundance history for GJ205",
             "# Each iteration is listed below the previous iteration.",
+            "# Parameter iteration N is the atmosphere used by abundance iteration N. After convergence, a dedicated final abundance-only fit produces the reported science abundances.",
         ],
         blocks,
     )
@@ -2862,7 +3155,7 @@ def update_parameter_history_table(
         [
             "# Cumulative atmospheric-parameter history for GJ205",
             "# Each iteration is listed below the previous iteration.",
-            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and Pass-1/Pass-2 consistency difference.",
+            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and absolute Pass-1-to-Pass-2 refinement shift.",
         ],
         blocks,
     )
@@ -2958,40 +3251,52 @@ def _parameter_convergence_details(
     iteration_id: int,
     config: AutoSpecFitConfig,
 ) -> List[Tuple[str, float, float, float, str, bool]]:
-    """Return before/after parameter changes for one abundance-cycle convergence check."""
+    """Return parameter changes and the iteration-dependent convergence status."""
     previous_values = _read_parameter_history_rounded_values(
         parameter_history_path,
-        iteration_id,
+        iteration_id - 1,
     )
     current_values = _read_parameter_history_rounded_values(
         parameter_history_path,
-        iteration_id + 1,
+        iteration_id,
     )
 
-    specifications: List[Tuple[str, str, float, str]] = [
-        ("Teff", "teff", float(config.teff_convergence_tolerance), "<="),
-        ("logg", "logg", float(config.logg_convergence_tolerance), "<="),
-        ("[M/H]", "metallicity", float(config.metallicity_convergence_tolerance), "<="),
+    specifications: List[Tuple[str, str, float]] = [
+        ("Teff", "teff", float(config.teff_convergence_tolerance)),
+        ("logg", "logg", float(config.logg_convergence_tolerance)),
+        ("[M/H]", "metallicity", float(config.metallicity_convergence_tolerance)),
+        ("vmic", "vmic", float(config.vmic_convergence_tolerance)),
+        ("[alpha/Fe]", "alpha", float(config.alpha_convergence_tolerance)),
     ]
-    if hasattr(config, "alpha_convergence_tolerance"):
-        specifications.append(
-            ("[alpha/Fe]", "alpha", float(config.alpha_convergence_tolerance), "<=")
-        )
-    specifications.append(
-        ("vmic", "vmic", float(config.vmic_convergence_tolerance), "<=")
-    )
 
-    details: List[Tuple[str, float, float, float, str, bool]] = []
-    for label, key, tolerance, operator in specifications:
+    raw: List[Tuple[str, float, float, float, float]] = []
+    for label, key, tolerance in specifications:
         previous = float(previous_values.get(key, np.nan))
         current = float(current_values.get(key, np.nan))
-        if np.isfinite(previous) and np.isfinite(current):
-            delta = abs(current - previous)
-            within = bool(delta <= (tolerance + 1.0e-10)) if operator == "<=" else bool(delta < tolerance)
+        delta = abs(current - previous) if np.isfinite(previous) and np.isfinite(current) else np.nan
+        raw.append((label, previous, current, delta, tolerance))
+
+    epsilon = 1.0e-10
+    above_one = [
+        i for i, (_, _, _, delta, tolerance) in enumerate(raw)
+        if np.isfinite(delta) and delta > tolerance + epsilon
+    ]
+    relaxed_index: Optional[int] = None
+    if int(iteration_id) >= 6 and len(above_one) == 1:
+        i = above_one[0]
+        delta = raw[i][3]
+        tolerance = raw[i][4]
+        if np.isfinite(delta) and delta <= 2.0 * tolerance + epsilon:
+            relaxed_index = i
+
+    details: List[Tuple[str, float, float, float, str, bool]] = []
+    for i, (label, previous, current, delta, tolerance) in enumerate(raw):
+        if i == relaxed_index:
+            within = True
+            threshold_text = f"<= {2.0 * tolerance:g} (2-step allowance)"
         else:
-            delta = np.nan
-            within = False
-        threshold_text = f"{operator} {tolerance:g}"
+            within = bool(np.isfinite(delta) and delta <= tolerance + epsilon)
+            threshold_text = f"<= {tolerance:g}"
         details.append((label, previous, current, delta, threshold_text, within))
     return details
 
@@ -3025,7 +3330,7 @@ def update_convergence_history_table(
     abundance_changes = np.asarray(abundance_changes, dtype=float)
 
     blocks = _read_vertical_history_blocks(path)
-    comparison_epsilon = ABUNDANCE_CONVERGENCE_MARGIN
+    comparison_epsilon = 0.0049
     if iteration_id < config.intermediate_convergence_start_iteration:
         active_tolerance = config.early_convergence_tolerance
     elif iteration_id < config.late_convergence_start_iteration:
@@ -3034,7 +3339,6 @@ def update_convergence_history_table(
         active_tolerance = config.late_convergence_tolerance
     else:
         active_tolerance = config.final_convergence_tolerance
-
     n_above_active = int(
         np.sum(
             np.isfinite(abundance_changes)
@@ -3044,10 +3348,7 @@ def update_convergence_history_table(
     n_above_010 = int(
         np.sum(
             np.isfinite(abundance_changes)
-            & (
-                abundance_changes
-                > config.final_convergence_tolerance + comparison_epsilon
-            )
+            & (abundance_changes > config.final_convergence_tolerance + comparison_epsilon)
         )
     )
 
@@ -3070,12 +3371,17 @@ def update_convergence_history_table(
         f"N_Elements_Above_0.10_dex: {n_above_010}",
         "",
         "ABUNDANCE CONVERGENCE",
-        f"Element   Previous_Abundance   Current_Abundance   Abs_Change   Within_{active_tolerance:.2f}_dex",
+        f"Element   Previous_ASF_Offset   Current_ASF_Offset   Abs_Change   Within_{active_tolerance:.2f}_dex",
     ]
     for element, previous, current, delta in zip(
         species.element_names, previous_abundances, current_abundances, abundance_changes
     ):
-        within = bool(np.isfinite(delta) and delta <= active_tolerance + comparison_epsilon)
+        if np.isnan(previous) and np.isnan(current):
+            within = True
+        else:
+            within = bool(
+                np.isfinite(delta) and delta <= (active_tolerance + comparison_epsilon)
+            )
         block.append(
             f"{element:<7}   {_format_history_float(previous):>18}   "
             f"{_format_history_float(current):>17}   "
@@ -3086,7 +3392,7 @@ def update_convergence_history_table(
     block.extend([
         "",
         f"ATMOSPHERIC-PARAMETER CONVERGENCE "
-        f"(parameter iterations {iteration_id} -> {iteration_id + 1})",
+        f"(parameter iterations {iteration_id - 1} -> {iteration_id})",
         "Parameter   Previous_Value   Current_Value   Abs_Change   Required_Change   Within_Tolerance",
     ])
     for label, previous, current, delta, threshold_text, within in parameter_details:
@@ -3114,7 +3420,7 @@ def update_convergence_history_table(
             "# Each completed iterative convergence check is listed vertically below the previous check.",
             "# Each block contains BOTH elemental-abundance and atmospheric-parameter changes.",
             "# Parameter iteration N is the atmosphere used by abundance iteration N; therefore the",
-            "# parameter convergence check after abundance iteration N compares parameter iterations N and N+1.",
+            "# convergence check at iteration N compares parameter iterations N-1 and N.",
             "# Overall convergence is satisfied only when BOTH abundance and atmospheric-parameter criteria are satisfied.",
             "# Maximum-iteration finalization is explicitly reported and is NOT labeled as convergence.",
         ],
@@ -3201,16 +3507,16 @@ def rebuild_history_outputs_from_restart(
         except Exception as exc:
             LOGGER.warning("Could not migrate legacy GJ205 parameter history: %s", exc)
 
-    # If the checkpoint is after a completed parameter cycle, abundance
-    # iteration N has produced parameter iteration N+1. Replace that parameter
-    # iteration with the richer checkpointed values/errors.
-    if next_stage in ("convergence", "finished"):
-        update_parameter_history_table(
-            parameter_path, iteration_id + 1, current_stellar_parameters,
-            last_real_parameter_values, last_parameter_errors,
-            last_parameter_consistency_shifts,
-        )
-
+    # Under the matched numbering convention, current_stellar_parameters always
+    # corresponds to parameter iteration N when iteration_id == N, regardless of
+    # whether the next stage is abundance, convergence, parameter refinement, or
+    # finalization. Restore that same numbered parameter row with the richer
+    # checkpointed values/errors.
+    update_parameter_history_table(
+        parameter_path, iteration_id, current_stellar_parameters,
+        last_real_parameter_values, last_parameter_errors,
+        last_parameter_consistency_shifts,
+    )
 
 @dataclass(frozen=True)
 class ParameterDiagnosticLines:
@@ -3229,7 +3535,12 @@ class ParameterDiagnosticLines:
         selected = self.line_numbers[mask]
         missing = sorted(set(requested.tolist()) - set(selected.tolist()))
         if missing:
-            raise ValueError(f"Diagnostic line numbers are missing from parameter line file: {missing}")
+            LOGGER.warning(
+                "Skipping requested diagnostic line(s) that are unavailable (RV=-999.9) or absent: %s",
+                missing,
+            )
+        if len(selected) == 0:
+            raise ValueError("No requested diagnostic lines are available after the RV != -999.9 availability check.")
         order = np.argsort(selected)
         return ParameterDiagnosticLines(
             line_numbers=self.line_numbers[mask][order],
@@ -3304,6 +3615,68 @@ def read_parameter_diagnostic_lines(path: Path) -> ParameterDiagnosticLines:
     )
 
 
+def select_available_parameter_lines(
+    all_parameter_lines: ParameterDiagnosticLines,
+    invalid_rv_sentinel: float = -999.9,
+) -> ParameterDiagnosticLines:
+    """Keep only parameter lines whose RV availability flag is valid."""
+    rv = np.asarray(all_parameter_lines.radial_velocities, dtype=float)
+    mask = (
+        np.isfinite(rv)
+        & (~np.isclose(
+            rv,
+            float(invalid_rv_sentinel),
+            atol=1.0e-8,
+            rtol=0.0,
+        ))
+    )
+    if not np.any(mask):
+        raise ValueError(
+            "No available parameter-diagnostic lines remain after applying "
+            f"the RV != {invalid_rv_sentinel} availability check."
+        )
+    order = np.argsort(all_parameter_lines.line_numbers[mask])
+    return ParameterDiagnosticLines(
+        line_numbers=all_parameter_lines.line_numbers[mask][order],
+        species_labels=all_parameter_lines.species_labels[mask][order],
+        line_centers=all_parameter_lines.line_centers[mask][order],
+        radial_velocities=all_parameter_lines.radial_velocities[mask][order],
+        fit_min_wavelengths=all_parameter_lines.fit_min_wavelengths[mask][order],
+        fit_max_wavelengths=all_parameter_lines.fit_max_wavelengths[mask][order],
+    )
+
+
+def read_parameter_sensitivity_file(
+    path: Path,
+    lines: ParameterDiagnosticLines,
+    wavelength_tolerance: float = 0.10,
+) -> np.ndarray:
+    """Read Line_Number, wavelength, sensitivity and align by line number.
+
+    Column 1 is the ASF line number, column 2 the wavelength, and column 3 the
+    sensitivity S_j,p. Matching is always by line number; wavelength is used
+    only as an integrity check. The returned array follows ``lines`` exactly.
+    """
+    path=Path(path)
+    if not path.exists(): raise FileNotFoundError(f'Parameter sensitivity file not found: {path}')
+    table=pd.read_csv(path,sep=r'\s+',comment='#',header=None,names=['Line_Number','Wavelength','Sensitivity'])
+    if table.shape[1]!=3 or table.empty: raise ValueError(f'Invalid sensitivity file: {path}')
+    table['Line_Number']=table['Line_Number'].astype(int)
+    if table['Line_Number'].duplicated().any(): raise ValueError(f'Duplicate line numbers in sensitivity file: {path}')
+    lookup=table.set_index('Line_Number')
+    missing=[int(n) for n in lines.line_numbers if int(n) not in lookup.index]
+    if missing: raise ValueError(f'Sensitivity file {path} is missing line numbers: {missing}')
+    out=[]
+    for n,w in zip(lines.line_numbers,lines.line_centers):
+        row=lookup.loc[int(n)]
+        sw=float(row['Wavelength']); sv=float(row['Sensitivity'])
+        if not np.isfinite(sv) or sv<0: raise ValueError(f'Invalid sensitivity for line {int(n)} in {path}: {sv}')
+        if np.isfinite(sw) and np.isfinite(w) and abs(sw-float(w))>wavelength_tolerance:
+            LOGGER.warning('Sensitivity wavelength check | line %d | parameter-line %.4f A | sensitivity-file %.4f A | file=%s',int(n),float(w),sw,path)
+        out.append(sv)
+    return np.asarray(out,dtype=float)
+
+
 def parameter_grid(config: AutoSpecFitConfig, parameter_name: str) -> np.ndarray:
     """Return the fixed one-dimensional trial grid for one fitted parameter."""
     return np.asarray(
@@ -3318,83 +3691,46 @@ def local_parameter_grid(
     center_value: float,
     half_width: float,
 ) -> np.ndarray:
-    """Return five Pass-2 trial points restricted to the Pass-1 grid.
+    """Return the local Pass-2 grid centered on the rounded Pass-1 solution.
 
-    Pass 2 first rounds ``center_value`` to the nearest point on the MAIN
-    (Pass-1) parameter grid.  It then selects five consecutive points from that
-    same grid, centered on the rounded Pass-1 value whenever possible.
-
-    Near either edge of the Pass-1 grid, the five-point window is shifted
-    inward.  Therefore every Pass-2 trial value is guaranteed to be an existing
-    Pass-1 grid value; Pass 2 never extends beyond the Pass-1 parameter grid.
-
-    ``half_width`` is retained as an explicit consistency check: it must match
-    the Pass-1 grid spacing used for the local refinement.
+    The continuous Pass-1 result is first rounded to the nearest Pass-1 grid
+    value. Pass 2 then uses the existing Pass-1 grid points lying within two
+    grid steps on either side of that rounded center. The local grid is never
+    extended outside the adopted Pass-1 parameter range and is never shifted
+    farther from the Pass-1 center merely to force five points. It therefore
+    contains five points in the interior, four one step from a boundary, and
+    three at a boundary.
     """
-    main_grid = parameter_grid(config, parameter_name)
-    if main_grid.size < 5:
-        raise RuntimeError(
-            f"Pass-1 grid for {parameter_name} must contain at least five points; "
-            f"obtained {main_grid.tolist()}."
-        )
-
-    rounded_center, _ = round_parameter_to_nearest_grid(
-        config, parameter_name, float(center_value)
-    )
-    if not np.isfinite(rounded_center):
-        raise ValueError(
-            f"Cannot construct Pass-2 grid for {parameter_name}: "
-            f"non-finite center value {center_value}."
-        )
-
+    if not np.isfinite(center_value):
+        raise ValueError(f"Cannot construct Pass-2 grid for {parameter_name}: non-finite center value {center_value}.")
     step = float(half_width)
     if not np.isfinite(step) or step <= 0:
-        raise ValueError(
-            f"Pass-2 step for {parameter_name} must be positive; got {half_width}."
-        )
-
-    grid_differences = np.diff(main_grid)
-    if np.any(grid_differences <= 0):
+        raise ValueError(f"Pass-2 step for {parameter_name} must be positive; got {half_width}.")
+    main_grid = np.asarray(parameter_grid(config, parameter_name), dtype=float)
+    if main_grid.size < 3:
+        raise RuntimeError(f"Pass-1 grid for {parameter_name} must contain at least three points.")
+    diffs = np.diff(main_grid)
+    if not np.allclose(diffs, step, rtol=0.0, atol=1.0e-8):
+        raise RuntimeError(f"Pass-2 step for {parameter_name} ({step}) does not match the Pass-1 grid spacing {diffs.tolist()}.")
+    center_index = int(np.argmin(np.abs(main_grid - float(center_value))))
+    rounded_center = float(main_grid[center_index])
+    start_index = max(0, center_index - 2)
+    stop_index = min(len(main_grid), center_index + 3)
+    local = np.asarray(main_grid[start_index:stop_index], dtype=float)
+    if len(local) < 3 or len(local) > 5 or len(np.unique(np.round(local, 10))) != len(local):
         raise RuntimeError(
-            f"Pass-1 grid for {parameter_name} must be strictly increasing; "
-            f"obtained {main_grid.tolist()}."
+            f"Pass-2 grid for {parameter_name} must contain 3--5 unique local Pass-1 grid points; "
+            f"obtained {local.tolist()}."
         )
-    if not np.allclose(grid_differences, step, rtol=0.0, atol=1.0e-8):
-        raise RuntimeError(
-            f"Pass-2 step for {parameter_name} ({step}) does not match the "
-            f"Pass-1 grid spacing {grid_differences.tolist()}."
-        )
-
-    center_index = int(np.argmin(np.abs(main_grid - float(rounded_center))))
-    start_index = center_index - 2
-    start_index = max(0, min(start_index, len(main_grid) - 5))
-    local = np.asarray(main_grid[start_index:start_index + 5], dtype=float)
-
-    if len(local) != 5 or len(np.unique(local)) != 5:
-        raise RuntimeError(
-            f"Pass-2 grid for {parameter_name} must contain exactly five unique "
-            f"Pass-1 points; obtained {local.tolist()}."
-        )
-
-    # Defensive membership check: every Pass-2 point must be on the Pass-1 grid.
-    for value in local:
-        if not np.any(np.isclose(main_grid, value, rtol=0.0, atol=1.0e-8)):
-            raise RuntimeError(
-                f"Pass-2 value {value} for {parameter_name} is outside the "
-                f"Pass-1 grid {main_grid.tolist()}."
-            )
-
     LOGGER.info(
-        "PASS-2 GRID | %s | Pass-1 result=%s | rounded center=%s | "
-        "step=%g | n_points=5 | restricted_to_pass1=True | values=%s",
-        parameter_name,
-        f"{float(center_value):.6f}",
-        format_parameter_value(parameter_name, rounded_center),
-        step,
-        ",".join(format_parameter_value(parameter_name, value) for value in local),
+        "PASS-2 GRID | %s | Pass-1 real=%s | rounded center=%s | step=%g | "
+        "restricted_to_Pass1=[%s,%s] | n_points=%d | values=%s",
+        parameter_name, f"{float(center_value):.6f}", format_parameter_value(parameter_name, rounded_center), step,
+        format_parameter_value(parameter_name, float(main_grid[0])), format_parameter_value(parameter_name, float(main_grid[-1])),
+        len(local), ",".join(format_parameter_value(parameter_name, value) for value in local),
     )
-
     return local
+
 
 def parameter_grid_strings(
     parameter_name: str,
@@ -3475,8 +3811,8 @@ def format_parameter_value(parameter_name: str, value: float) -> str:
     """Return the canonical Turbospectrum/file string for a parameter value.
 
     This formatter provides canonical Turbospectrum/file strings for parameter
-    values.  Adopted parameters and all Pass-2 trial points are restricted to
-    the MAIN (Pass-1) fitting grid.
+    values.  Pass-1 values use the selected target-specific grid, while Pass-2
+    trial points remain within that selected grid.
 
     Canonical formats are:
         Teff       : integer K
@@ -3490,8 +3826,8 @@ def format_parameter_value(parameter_name: str, value: float) -> str:
         raise ValueError(f"Cannot format non-finite {parameter_name}={value}.")
 
     if parameter_name == "teff":
-        if value > 3900.0 + 1.0e-8:
-            raise ValueError(f"Teff={value} exceeds the hard Pass-2 limit of 3900 K.")
+        if value < 3000.0 - 1.0e-8 or value > 3900.0 + 1.0e-8:
+            raise ValueError(f"Teff={value} is outside the hard allowed range 3000--3900 K.")
         return f"{int(round(value))}"
 
     if parameter_name == "logg":
@@ -3502,18 +3838,18 @@ def format_parameter_value(parameter_name: str, value: float) -> str:
         return f"{value:+.1f}"
 
     if parameter_name == "metallicity":
-        if value > 0.50 + 1.0e-8:
+        if value < -1.00 - 1.0e-8 or value > 0.50 + 1.0e-8:
             raise ValueError(
-                f"[M/H]={value} exceeds the hard Pass-2 upper limit of +0.50."
+                f"[M/H]={value} is outside the hard allowed range -1.00--+0.50."
             )
         if abs(value) < 5.0e-9:
             value = 0.0
         return f"{value:+.2f}"
 
     if parameter_name == "alpha":
-        if value < -0.20 - 1.0e-8:
+        if value < -0.20 - 1.0e-8 or value > 0.40 + 1.0e-8:
             raise ValueError(
-                f"[alpha/Fe]={value} is below the hard Pass-2 lower limit of -0.20."
+                f"[alpha/Fe]={value} is outside the hard allowed range -0.20--+0.40."
             )
         if abs(value) < 5.0e-9:
             value = 0.0
@@ -3569,29 +3905,52 @@ def round_all_stellar_parameters_to_grids(
     stellar_parameters: StellarParameters,
 ) -> StellarParameters:
     """
-    Round every atmospheric parameter to the nearest point on its adopted grid
-    and return canonical strings for all TS/model filenames.
+    Canonicalize stellar parameters for TS/model filenames.
 
-    This is used at the start of a fresh run and after loading a checkpoint so
-    filename formatting cannot drift between stages or restarts.
+    Teff, log g, and [M/H] are rounded on their permitted hard grids so that
+    valid Pass-2 solutions outside the selected Pass-1 grid are preserved.
+    vmic and [alpha/Fe] are rounded to their adopted explicit grids.
     """
     rounded_strings: Dict[str, str] = {}
+
     for parameter_name, raw_value in (
         ("teff", stellar_parameters.teff),
         ("logg", stellar_parameters.logg),
         ("metallicity", stellar_parameters.metallicity),
-        ("alpha", stellar_parameters.alpha),
         ("vmic", stellar_parameters.vmic),
+        ("alpha", stellar_parameters.alpha),
     ):
-        rounded_value, rounded_string = round_parameter_to_nearest_grid(
-            config,
-            parameter_name,
-            float(raw_value),
-        )
-        if not np.isfinite(rounded_value):
+        value = float(raw_value)
+        if not np.isfinite(value):
             raise ValueError(
-                f"Cannot round non-finite stellar parameter {parameter_name}={raw_value}."
+                f"Cannot canonicalize non-finite stellar parameter {parameter_name}={raw_value}."
             )
+
+        if parameter_name in ("vmic", "alpha"):
+            _, rounded_string = round_parameter_to_nearest_grid(
+                config, parameter_name, value
+            )
+        else:
+            step = {
+                "teff": config.teff_step,
+                "logg": config.logg_step,
+                "metallicity": config.metallicity_step,
+            }[parameter_name]
+            hard_min = {
+                "teff": config.hard_teff_min,
+                "logg": config.hard_logg_min,
+                "metallicity": config.hard_metallicity_min,
+            }[parameter_name]
+            hard_max = {
+                "teff": config.hard_teff_max,
+                "logg": config.hard_logg_max,
+                "metallicity": config.hard_metallicity_max,
+            }[parameter_name]
+            hard_grid = np.arange(hard_min, hard_max + 0.5 * step, step)
+            index = int(np.argmin(np.abs(hard_grid - value)))
+            rounded_value = float(hard_grid[index])
+            rounded_string = format_parameter_value(parameter_name, rounded_value)
+
         rounded_strings[parameter_name] = rounded_string
 
     return StellarParameters(
@@ -3947,8 +4306,8 @@ def estimate_individual_line_parameter(
     roots = np.real(roots[np.isreal(roots)])
     roots = np.sort(roots)
 
-    left_roots = roots[roots <= vertex]
-    right_roots = roots[roots >= vertex]
+    left_roots = roots[(roots <= vertex) & (roots >= float(np.min(x)))]
+    right_roots = roots[(roots >= vertex) & (roots <= float(np.max(x)))]
 
     if len(left_roots) == 0 or len(right_roots) == 0:
         return vertex, np.nan, "internal", chi2_min
@@ -3963,58 +4322,64 @@ def estimate_individual_line_parameter(
 def combine_individual_line_parameter_results(
     parameter_values: np.ndarray,
     chi2_errors: np.ndarray,
+    sensitivities: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, float, float, int, int]:
+    """Combine independent line-by-line parameter measurements.
+
+    Pass 1 uses the arithmetic mean of all finite individual-line parameter
+    estimates. Pass 2 supplies ``sensitivities`` and uses weights proportional
+    to S_j,p after applying the exact same finite-line mask used for p_j.
+
+    The line-to-line term is the ordinary sample standard deviation in Pass 1.
+    In the sensitivity-weighted case it is the unbiased weighted scatter,
+    sqrt(sum(w_j (p_j-pbar)^2)/(1-sum(w_j^2))). The individual-line
+    Delta-chi2=1 errors are combined by an unweighted RMS in Pass 1 and by a
+    sensitivity-weighted RMS in Pass 2, with weights renormalized over only the
+    subset having valid positive formal errors. The random parameter error is
+    the quadrature sum of the available line-scatter and chi2-error terms.
     """
-    Combine independent line-by-line parameter measurements.
-
-    The adopted parameter is the simple arithmetic mean of all finite line
-    results, including values whose minima lie at the physically allowed grid
-    boundaries.
-
-    The final uncertainty is
-
-        sqrt(line_to_line_std^2 + rms_finite_chi2_error^2)
-
-    Edge-minimum lines contribute to the mean and line-to-line scatter, but
-    their NaN formal chi-square errors are excluded from the RMS chi-square term.
-    """
-    values = np.asarray(parameter_values, dtype=float)
-    errors = np.asarray(chi2_errors, dtype=float)
-
-    finite_values = values[np.isfinite(values)]
-    if len(finite_values) == 0:
-        return np.nan, np.nan, np.nan, np.nan, 0, 0
-
-    mean_value = float(np.mean(finite_values))
-
-    if len(finite_values) >= 2:
-        line_std = float(np.std(finite_values, ddof=1))
+    values=np.asarray(parameter_values,dtype=float)
+    errors=np.asarray(chi2_errors,dtype=float)
+    if sensitivities is None:
+        finite=np.isfinite(values)
+        vals=values[finite]
+        if len(vals)==0: return np.nan,np.nan,np.nan,np.nan,0,0
+        adopted=float(np.mean(vals))
+        line_std=float(np.std(vals,ddof=1)) if len(vals)>=2 else np.nan
+        valid_err=np.isfinite(values) & np.isfinite(errors) & (errors>0)
+        ferr=errors[valid_err]
+        chi2_rms=float(np.sqrt(np.mean(ferr**2))) if len(ferr)>0 else np.nan
+        nerr=int(len(ferr))
     else:
-        line_std = np.nan
-
-    finite_errors = errors[np.isfinite(errors) & (errors > 0)]
-    if len(finite_errors) > 0:
-        chi2_rms = float(np.sqrt(np.mean(finite_errors**2)))
-    else:
-        chi2_rms = np.nan
-
-    if np.isfinite(line_std) and np.isfinite(chi2_rms):
-        final_error = float(np.sqrt(line_std**2 + chi2_rms**2))
-    elif np.isfinite(line_std):
-        final_error = line_std
-    elif np.isfinite(chi2_rms):
-        final_error = chi2_rms
-    else:
-        final_error = np.nan
-
-    return (
-        mean_value,
-        line_std,
-        chi2_rms,
-        final_error,
-        int(len(finite_values)),
-        int(len(finite_errors)),
-    )
+        s=np.asarray(sensitivities,dtype=float)
+        if s.shape != values.shape:
+            raise ValueError('Sensitivity array must match individual-line parameter array.')
+        finite=np.isfinite(values) & np.isfinite(s) & (s>=0)
+        vals=values[finite]; ss=s[finite]
+        if len(vals)==0: return np.nan,np.nan,np.nan,np.nan,0,0
+        total=float(np.sum(ss))
+        if not np.isfinite(total) or total<=0:
+            raise RuntimeError('Finite Pass-2 line sensitivities have non-positive total weight.')
+        w=ss/total
+        adopted=float(np.sum(w*vals))
+        denom=float(1.0-np.sum(w**2))
+        line_std=float(np.sqrt(np.sum(w*(vals-adopted)**2)/denom)) if len(vals)>=2 and denom>0 else np.nan
+        valid_err=np.isfinite(values) & np.isfinite(errors) & (errors>0) & np.isfinite(s) & (s>=0)
+        if np.any(valid_err):
+            se=s[valid_err]; ee=errors[valid_err]
+            st=float(np.sum(se))
+            if not np.isfinite(st) or st<=0:
+                chi2_rms=np.nan; nerr=0
+            else:
+                we=se/st
+                chi2_rms=float(np.sqrt(np.sum(we*ee**2))); nerr=int(len(ee))
+        else:
+            chi2_rms=np.nan; nerr=0
+    if np.isfinite(line_std) and np.isfinite(chi2_rms): final=float(np.sqrt(line_std**2+chi2_rms**2))
+    elif np.isfinite(line_std): final=line_std
+    elif np.isfinite(chi2_rms): final=chi2_rms
+    else: final=np.nan
+    return adopted,line_std,chi2_rms,final,int(np.sum(finite)),nerr
 
 
 def write_current_parameter_table(
@@ -4062,8 +4427,8 @@ def write_final_parameter_table(
 ) -> None:
     """Write final stellar parameters with their random fitting errors only.
 
-    No parameter consistency or total error is reported because the Pass-1 to
-    Pass-2 change is a refinement/consistency diagnostic, not an independently
+    No Pass-1-to-Pass-2 shift or total error is reported because the Pass-1 to
+    Pass-2 change is a refinement diagnostic, not an independently
     quantified systematic uncertainty.
     """
     labels = [
@@ -4093,7 +4458,7 @@ def write_final_parameter_table(
     with open(output_path, "w") as handle:
         handle.write(
             "# Final stellar parameters and 1-sigma random fitting uncertainties\n"
-            "# Pass-1 to Pass-2 differences are consistency diagnostics only and\n"
+            "# Pass-1 to Pass-2 differences are refinement-shift diagnostics only and\n"
             "# are not interpreted as systematic parameter uncertainties.\n"
         )
         if convergence_summary:
@@ -4104,6 +4469,97 @@ def write_final_parameter_table(
             handle, sep=" ", index=False, float_format="%.6f", na_rep="nan"
         )
     LOGGER.info("Wrote final stellar-parameter table: %s", output_path)
+
+
+def _parameter_grid_step(config: AutoSpecFitConfig, parameter_name: str) -> float:
+    return {
+        "teff": float(config.teff_step),
+        "logg": float(config.logg_step),
+        "metallicity": float(config.metallicity_step),
+        "vmic": 0.20,
+        "alpha": 0.10,
+    }[parameter_name]
+
+
+def _load_diagnostic_consistency_history(config: AutoSpecFitConfig) -> Dict:
+    path = Path(config.output_dir) / config.diagnostic_consistency_history_file
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as handle:
+            content = "".join(line for line in handle if not line.lstrip().startswith("#"))
+        return json.loads(content) if content.strip() else {}
+    except Exception as exc:
+        LOGGER.warning("Could not read diagnostic-consistency history %s: %s", path, exc)
+        return {}
+
+
+def _save_diagnostic_consistency_history(config: AutoSpecFitConfig, payload: Dict) -> None:
+    path = Path(config.output_dir) / config.diagnostic_consistency_history_file
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as handle:
+        handle.write("# ASF parameter diagnostic-consistency history; JSON body below.\n")
+        json.dump(payload, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _record_and_test_diagnostic_consistency(
+    config: AutoSpecFitConfig, iteration_id: int, parameter_pass: int,
+    parameter_name: str, previous_parameter_value: float, proposed_parameter_value: float,
+    line_scatter: float, line_values: np.ndarray,
+) -> Tuple[bool, str]:
+    """Record diagnostic scatter and decide whether a Pass-1 update is trustworthy.
+
+    Rejection requires ALL of the following: guard enabled and active; Pass 1;
+    proposed movement > configured number of grid steps; current line scatter >
+    configured number of grid steps; and scatter degradation relative to the
+    preceding iteration by at least the configured ratio.
+    """
+    history = _load_diagnostic_consistency_history(config)
+    key = f"pass{parameter_pass}:{parameter_name}"
+    series = history.setdefault(key, {})
+    previous_entry = series.get(str(int(iteration_id) - 1), {})
+    previous_scatter = previous_entry.get("line_scatter", None)
+    step = _parameter_grid_step(config, parameter_name)
+    shift = abs(float(proposed_parameter_value) - float(previous_parameter_value))
+    shift_steps = shift / step if step > 0 else np.inf
+    current_scatter_steps = float(line_scatter) / step if np.isfinite(line_scatter) and step > 0 else np.nan
+    scatter_ratio = (
+        float(line_scatter) / float(previous_scatter)
+        if np.isfinite(line_scatter) and previous_scatter is not None
+        and np.isfinite(float(previous_scatter)) and float(previous_scatter) > 0
+        else np.nan
+    )
+    finite_line_values = [float(v) for v in np.asarray(line_values, dtype=float) if np.isfinite(v)]
+    reject = bool(
+        config.diagnostic_consistency_guard_enabled
+        and int(iteration_id) >= int(config.diagnostic_consistency_guard_start_iteration)
+        and int(parameter_pass) == 1
+        and previous_scatter is not None
+        and np.isfinite(scatter_ratio)
+        and shift_steps > float(config.diagnostic_consistency_min_shift_steps)
+        and np.isfinite(current_scatter_steps)
+        and current_scatter_steps > float(config.diagnostic_consistency_min_current_scatter_steps)
+        and scatter_ratio >= float(config.diagnostic_consistency_scatter_ratio)
+    )
+    series[str(int(iteration_id))] = {
+        "line_scatter": None if not np.isfinite(line_scatter) else float(line_scatter),
+        "line_values": finite_line_values,
+        "previous_parameter_value": float(previous_parameter_value),
+        "proposed_parameter_value": float(proposed_parameter_value),
+        "shift_steps": None if not np.isfinite(shift_steps) else float(shift_steps),
+        "previous_line_scatter": previous_scatter,
+        "scatter_ratio": None if not np.isfinite(scatter_ratio) else float(scatter_ratio),
+        "rejected": reject,
+    }
+    _save_diagnostic_consistency_history(config, history)
+    reason = (
+        f"shift={shift_steps:.2f} steps; current scatter={current_scatter_steps:.2f} steps; "
+        f"previous scatter={previous_scatter}; ratio=" + (f"{scatter_ratio:.2f}" if np.isfinite(scatter_ratio) else "nan")
+    )
+    return reject, reason
 
 
 def evaluate_parameter_grid(
@@ -4117,7 +4573,8 @@ def evaluate_parameter_grid(
     flux_star: np.ndarray,
     err_flux_star: np.ndarray,
     config: AutoSpecFitConfig,
-) -> Tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
+    sensitivities: Optional[np.ndarray] = None,
+) -> Tuple[float, float, np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Evaluate one atmospheric-parameter grid line by line.
 
@@ -4127,13 +4584,17 @@ def evaluate_parameter_grid(
     Minima at the adopted physical grid boundaries are retained as valid
     parameter measurements but receive NaN formal chi-square errors.
 
-    In parameter Pass 2, exactly five original-grid points are examined around
-    the rounded Pass-1 solution.  A local parabola is fitted to each valid
+    In parameter Pass 2, up to five original-grid points are examined within
+    two grid steps of the rounded Pass-1 solution. Near a grid boundary the
+    local grid is truncated to four or three points rather than shifted or
+    extended. A local parabola is fitted to each valid
     line-by-line chi-square curve, exactly as in Pass 1, so that the final
     refinement has its own Delta-chi2=1 formal uncertainty.
 
-    The adopted parameter is the simple mean of all finite individual-line
-    parameter measurements.  In both Pass 1 and Pass 2, the uncertainty combines
+    The adopted parameter is the arithmetic mean of finite individual-line
+    measurements in Pass 1. In Pass 2, [M/H], log g, and Teff use the
+    sensitivity-weighted mean, while vmic remains an arithmetic all-lines mean
+    because no vmic sensitivity file is supplied. The uncertainty combines
     the line-to-line sample standard deviation and the RMS of the finite
     individual-line chi-square errors in quadrature.
 
@@ -4154,7 +4615,7 @@ def evaluate_parameter_grid(
         )
 
         for line_index in range(lines.n_lines):
-            chi2_matrix[line_index, grid_index] = parameter_line_chi2_for_model(
+            chi2_value = parameter_line_chi2_for_model(
                 line_center=float(lines.line_centers[line_index]),
                 radial_velocity=float(lines.radial_velocities[line_index]),
                 fit_min=float(lines.fit_min_wavelengths[line_index]),
@@ -4164,6 +4625,22 @@ def evaluate_parameter_grid(
                 flux_star=flux_star,
                 err_flux_star=err_flux_star,
                 config=config,
+            )
+            chi2_matrix[line_index, grid_index] = chi2_value
+            LOGGER.info(
+                "CHI2 | PARAMETER ITERATION %d.%d | PARAMETER %s | "
+                "line %d | species %s | center %.6f | value=%s | "
+                "grid %d/%d | chi2=%.12e",
+                iteration_id,
+                parameter_pass,
+                parameter_name,
+                int(lines.line_numbers[line_index]),
+                str(lines.species_labels[line_index]),
+                float(lines.line_centers[line_index]),
+                format_parameter_value(parameter_name, value),
+                grid_index + 1,
+                len(grid),
+                chi2_value,
             )
 
     # Retain the original fair-comparison combined curve as a diagnostic only.
@@ -4198,6 +4675,15 @@ def evaluate_parameter_grid(
             line_chi2_min[line_index],
         ) = estimate_individual_line_parameter(grid, curve)
 
+    normalized_weights = np.full(lines.n_lines, np.nan, dtype=float)
+    if sensitivities is not None:
+        sens_array = np.asarray(sensitivities, dtype=float)
+        valid_weight = np.isfinite(line_best) & np.isfinite(sens_array) & (sens_array >= 0)
+        sensitivity_sum = float(np.sum(sens_array[valid_weight]))
+        if not np.isfinite(sensitivity_sum) or sensitivity_sum <= 0:
+            raise RuntimeError(f"No positive finite sensitivity weight remains for Pass-2 {parameter_name}.")
+        normalized_weights[valid_weight] = sens_array[valid_weight] / sensitivity_sum
+
     (
         adopted_value,
         line_std,
@@ -4205,7 +4691,7 @@ def evaluate_parameter_grid(
         final_error,
         n_line_values,
         n_chi2_errors,
-    ) = combine_individual_line_parameter_results(line_best, line_errors)
+    ) = combine_individual_line_parameter_results(line_best, line_errors, sensitivities=sensitivities)
 
     if not np.isfinite(adopted_value):
         raise RuntimeError(
@@ -4240,6 +4726,8 @@ def evaluate_parameter_grid(
             "Line_Number": lines.line_numbers.astype(int),
             "Species": lines.species_labels.astype(str),
             "Line_Center": lines.line_centers.astype(float),
+            "Sensitivity": (np.asarray(sensitivities, dtype=float) if sensitivities is not None else np.full(lines.n_lines, np.nan)),
+            "Normalized_Weight": normalized_weights,
             "Sampled_Best": sampled_best,
             "Best_Parameter": line_best,
             "Chi2_Min": line_chi2_min,
@@ -4259,7 +4747,7 @@ def evaluate_parameter_grid(
     # Append the ensemble statistics as comments.
     with open(result_path, "a") as handle:
         handle.write("\n# Individual-line parameter summary\n")
-        handle.write(f"# Mean_Parameter {adopted_value:.8f}\n")
+        handle.write(f"# Adopted_Parameter {adopted_value:.8f}\n")
         handle.write("# Fit_Method local_parabola_for_internal_minima\n")
         handle.write(
             f"# Line_to_Line_Std "
@@ -4320,7 +4808,7 @@ def evaluate_parameter_grid(
             format_parameter_value(parameter_name, combined_best_value),
         )
 
-    return adopted_value, final_error, total_chi2, chi2_matrix, line_best
+    return adopted_value, final_error, total_chi2, chi2_matrix, line_best, line_std
 
 
 def run_one_parameter_refinement_step(
@@ -4337,7 +4825,8 @@ def run_one_parameter_refinement_step(
     config: AutoSpecFitConfig,
     selected_lines_override: Optional[ParameterDiagnosticLines] = None,
     grid_override: Optional[np.ndarray] = None,
-) -> Tuple[StellarParameters, float, float]:
+    sensitivity_file: Optional[Path] = None,
+) -> Tuple[StellarParameters, float, float, bool]:
     """
     Generate the TS grid, fit every selected diagnostic line independently,
     adopt the arithmetic mean line parameter, and return the empirical+formal
@@ -4346,6 +4835,7 @@ def run_one_parameter_refinement_step(
     ``selected_lines_override`` is used for dynamic selections such as all
     lines for vmic and Species-column alpha-element selection.
     """
+    step_start_time = time.perf_counter()
     grid = (
         parameter_grid(config, parameter_name)
         if grid_override is None
@@ -4421,12 +4911,21 @@ def run_one_parameter_refinement_step(
 
     wait_for_model_files([model_paths], config)
 
+    sensitivity_values = None
+    if sensitivity_file is not None:
+        sensitivity_values = read_parameter_sensitivity_file(sensitivity_file, selected_lines)
+        LOGGER.info(
+            "PASS-2 SENSITIVITY WEIGHTING | iteration %d.%d | %s | file=%s | available lines=%d | positive total sensitivity=%.8g",
+            iteration_id, parameter_pass, parameter_name, sensitivity_file, selected_lines.n_lines, float(np.sum(sensitivity_values)),
+        )
+
     (
         adopted_value,
         parameter_error,
         _total_chi2,
         _chi2_matrix,
         _line_best,
+        line_scatter,
     ) = evaluate_parameter_grid(
         iteration_id=iteration_id,
         parameter_pass=parameter_pass,
@@ -4438,16 +4937,17 @@ def run_one_parameter_refinement_step(
         flux_star=flux_star,
         err_flux_star=err_flux_star,
         config=config,
+        sensitivities=sensitivity_values,
     )
 
     # The continuous parabolic best-fit value is retained as the REAL reported
-    # result and is used for the Pass-2 consistency test and uncertainty.
+    # result and is used for the Pass-1-to-Pass-2 refinement-shift diagnostic and uncertainty.
     #
     # Before ANY result is propagated to the next parameter/abundance step,
     # however, it is rounded to the appropriate synthesis grid.  Pass 1 rounds
     # to the MAIN grid.  An accepted Pass-2 result rounds to the nearest point
-    # on its five-point LOCAL Pass-2 grid, restricted entirely to the main
-    # Pass-1 grid.  Thus the scientific fit remains continuous,
+    # on its local Pass-2 grid of three to five points, always restricted to
+    # the selected Pass-1 range. Thus the scientific fit remains continuous,
     # while every atmosphere/synthetic-spectrum calculation receives a grid-
     # compatible parameter value.
     if parameter_pass == 2 and grid_override is not None:
@@ -4465,6 +4965,30 @@ def run_one_parameter_refinement_step(
             parameter_name,
             adopted_value,
         )
+
+    rejected_by_consistency = False
+    if parameter_pass == 1 and parameter_name in ("vmic", "metallicity", "logg", "teff", "alpha"):
+        previous_value = float(getattr(stellar_parameters, parameter_name))
+        rejected_by_consistency, guard_reason = _record_and_test_diagnostic_consistency(
+            config=config, iteration_id=iteration_id, parameter_pass=parameter_pass,
+            parameter_name=parameter_name, previous_parameter_value=previous_value,
+            proposed_parameter_value=propagated_value, line_scatter=line_scatter,
+            line_values=_line_best,
+        )
+        if rejected_by_consistency:
+            LOGGER.warning(
+                "DIAGNOSTIC CONSISTENCY REJECTION | iteration %d.%d | %s | "
+                "proposed=%s | retaining previous=%s | %s",
+                iteration_id, parameter_pass, parameter_name, propagated_string,
+                format_parameter_value(parameter_name, previous_value), guard_reason,
+            )
+            propagated_value = previous_value
+            propagated_string = format_parameter_value(parameter_name, previous_value)
+        else:
+            LOGGER.info(
+                "DIAGNOSTIC CONSISTENCY CHECK | iteration %d.%d | %s | ACCEPT | %s",
+                iteration_id, parameter_pass, parameter_name, guard_reason,
+            )
 
     updated_parameters = update_one_stellar_parameter(
         stellar_parameters,
@@ -4484,7 +5008,12 @@ def run_one_parameter_refinement_step(
         propagated_string,
     )
 
-    return updated_parameters, parameter_error, adopted_value
+    LOGGER.info(
+        "STEP TIMER | parameter iteration %d.%d | %s | elapsed=%s",
+        iteration_id, parameter_pass, parameter_name,
+        _format_elapsed(time.perf_counter() - step_start_time),
+    )
+    return updated_parameters, parameter_error, adopted_value, rejected_by_consistency
 
 
 def gj205_parameter_refiner(
@@ -4506,12 +5035,13 @@ def gj205_parameter_refiner(
     chosen for each target according to the availability, strength, and
     distinctiveness of their diagnostic lines. A parameter without a suitable
     diagnostic subset should be placed last among these three and fitted with
-    all selected parameter lines. [alpha/Fe] remains fixed at its original
-    input value throughout the refinement.
+    all selected parameter lines. [alpha/Fe] is then fitted last using the
+    available selected alpha-element lines.
 
     Pass 1 follows the target-specific diagnostic-line strategy encoded below.
     Pass 2 is a narrow verification/refinement around the Pass-1 result and uses
-    all selected parameter lines for vmic, [M/H], log g, and Teff. Each fitted
+    all selected parameter lines in the same order as Pass 1: vmic, [M/H], log g, Teff,
+    and [alpha/Fe]. Each fitted
     parameter uses the most recently updated atmosphere from the preceding
     Pass-2 sub-step. Local grids
     are subsets of the original grids, centered after rounding the Pass-1 result
@@ -4520,7 +5050,16 @@ def gj205_parameter_refiner(
     del iteration_results, line_lists
 
     starting_parameters = stellar_parameters
-    all_parameter_lines = read_parameter_diagnostic_lines(config.parameter_line_file)
+    all_parameter_lines = select_available_parameter_lines(
+        read_parameter_diagnostic_lines(config.parameter_line_file)
+    )
+    LOGGER.info(
+        "AVAILABLE PARAMETER LINES | fourth-column RV != -999.9 | %d lines",
+        all_parameter_lines.n_lines,
+    )
+    available_parameter_lines = all_parameter_lines
+    alpha_parameter_lines = all_parameter_lines.select_species(config.alpha_species)
+    LOGGER.info("AVAILABLE ALPHA PARAMETER LINES | %d lines | species=%s", alpha_parameter_lines.n_lines, ",".join(config.alpha_species))
 
     fixed_abundances = fixed_abundance_map_from_iteration(
         rounded_abundances=rounded_abundances,
@@ -4534,35 +5073,34 @@ def gj205_parameter_refiner(
         starting_parameters=starting_parameters,
     )
 
-    keys = ("vmic", "metallicity", "logg", "teff")
+    keys = ("vmic", "metallicity", "logg", "teff", "alpha")
     completed_steps: List[str] = []
     current = starting_parameters
     parameter_errors: Dict[str, float] = {key: np.nan for key in keys}
     parameter_consistency_shifts: Dict[str, float] = {key: np.nan for key in keys}
     real_parameter_values: Dict[str, float] = {key: np.nan for key in keys}
-    real_parameter_values["alpha"] = float(starting_parameters.alpha)
     first_pass_real_values: Dict[str, float] = {key: np.nan for key in keys}
+    previous_iteration_real_values: Dict[str, float] = {}
+    previous_iteration_errors: Dict[str, float] = {}
+    if iteration_id > 1:
+        try:
+            _prev_params, previous_iteration_real_values, previous_iteration_errors, _prev_shifts = (
+                _read_parameter_history_iteration_state(
+                    Path(config.output_dir) / config.parameter_history_file, iteration_id - 1
+                )
+            )
+        except Exception:
+            previous_iteration_real_values = {}
+            previous_iteration_errors = {}
 
     if progress is not None:
         completed_steps = list(progress.get("completed_steps", []))
         current = progress["current_parameters_obj"]
-        # Older checkpoints may contain a fitted alpha value. Restore the
-        # original input alpha unconditionally so alpha is fixed even when a
-        # run is resumed from a pre-change checkpoint.
-        current = update_one_stellar_parameter(
-            current,
-            "alpha",
-            float(starting_parameters.alpha),
-            use_exact_grid_format=True,
-        )
         parameter_errors.update(progress.get("parameter_errors_dict", {}))
-        parameter_errors.pop("alpha", None)
         real_parameter_values.update(progress.get("real_parameter_values_dict", {}))
-        real_parameter_values["alpha"] = float(starting_parameters.alpha)
         parameter_consistency_shifts.update(
             progress.get("parameter_consistency_shifts_dict", {})
         )
-        parameter_consistency_shifts.pop("alpha", None)
         first_pass_real_values.update(progress.get("first_pass_real_values_dict", {}))
 
     def checkpoint_step(step_name: str) -> None:
@@ -4600,7 +5138,7 @@ def gj205_parameter_refiner(
         nonlocal current
         if step_name in completed_steps:
             return
-        current, error, real_value = run_one_parameter_refinement_step(
+        current, error, real_value, consistency_rejected = run_one_parameter_refinement_step(
             iteration_id=iteration_id,
             parameter_pass=1,
             parameter_name=parameter_name,
@@ -4614,13 +5152,29 @@ def gj205_parameter_refiner(
             config=config,
             selected_lines_override=selected_lines_override,
         )
+        if consistency_rejected:
+            previous_real = previous_iteration_real_values.get(parameter_name, np.nan)
+            previous_error = previous_iteration_errors.get(parameter_name, np.nan)
+            if np.isfinite(previous_real):
+                real_value = float(previous_real)
+            else:
+                real_value = float(getattr(starting_parameters, parameter_name))
+            if np.isfinite(previous_error):
+                error = float(previous_error)
+            LOGGER.warning(
+                "DIAGNOSTIC CONSISTENCY FALLBACK | iteration %d.1 | %s | "
+                "retained previous real=%s error=%s for Pass-2 centering/reporting",
+                iteration_id, parameter_name,
+                f"{real_value:.6f}" if np.isfinite(real_value) else "nan",
+                f"{error:.6f}" if np.isfinite(error) else "nan",
+            )
         parameter_errors[parameter_name] = error
         real_parameter_values[parameter_name] = real_value
         first_pass_real_values[parameter_name] = real_value
         checkpoint_step(step_name)
 
     # --------------------------- Pass 1 ---------------------------
-    run_pass1_step("p1_vmic", "vmic", selected_lines_override=all_parameter_lines)
+    run_pass1_step("p1_vmic", "vmic", selected_lines_override=available_parameter_lines)
     run_pass1_step(
         "p1_metallicity", "metallicity",
         diagnostic_line_numbers=config.metallicity_diagnostic_lines,
@@ -4631,12 +5185,16 @@ def gj205_parameter_refiner(
     run_pass1_step(
         "p1_teff", "teff", diagnostic_line_numbers=config.teff_diagnostic_lines
     )
+    run_pass1_step(
+        "p1_alpha", "alpha", selected_lines_override=alpha_parameter_lines
+    )
     # --------------------------- Pass 2 ---------------------------
     half_widths = {
         "vmic": config.second_pass_vmic_half_width,
         "metallicity": config.second_pass_metallicity_half_width,
         "logg": config.second_pass_logg_half_width,
         "teff": config.second_pass_teff_half_width,
+        "alpha": config.second_pass_alpha_half_width,
     }
 
     for parameter_name in keys:
@@ -4646,10 +5204,9 @@ def gj205_parameter_refiner(
 
         # Pass 2 is anchored to the Pass-1 result for this same parameter.
         # First round the continuous Pass-1 result to the nearest Pass-1/original
-        # grid value.  Then select five consecutive points from that same grid,
-        # centered on the rounded value whenever possible.  Near a grid edge,
-        # shift the five-point window inward; no Pass-2 point may lie outside
-        # the Pass-1 grid.
+        # grid value. Then select the existing Pass-1 grid points within two
+        # grid steps on either side. Near a Pass-1 boundary the local grid is
+        # truncated to three or four points rather than shifted or extended.
         pass1_real = first_pass_real_values.get(parameter_name, np.nan)
         if not np.isfinite(pass1_real):
             raise RuntimeError(
@@ -4677,13 +5234,11 @@ def gj205_parameter_refiner(
         )
 
         # Preserve the Pass-1 formal/random error before Pass 2 is evaluated.
-        # If the Pass-2 solution moves by more than one main-grid step from
-        # the rounded Pass-1 center, Pass 2 is treated as inconsistent with the
-        # intended local refinement.  In that case both the adopted value and
-        # uncertainty for this parameter revert to Pass 1.
+        # It is used only as the safe fallback if Pass 2 fails to return a
+        # finite solution; finite Pass-2 solutions are always accepted.
         pass1_error = float(parameter_errors.get(parameter_name, np.nan))
 
-        current_after_pass2, pass2_error, pass2_real = run_one_parameter_refinement_step(
+        current_after_pass2, pass2_error, pass2_real, _pass2_guard_rejected = run_one_parameter_refinement_step(
             iteration_id=iteration_id,
             parameter_pass=2,
             parameter_name=parameter_name,
@@ -4695,57 +5250,44 @@ def gj205_parameter_refiner(
             flux_star=flux_star,
             err_flux_star=err_flux_star,
             config=config,
-            selected_lines_override=all_parameter_lines,
+            selected_lines_override=(alpha_parameter_lines if parameter_name == "alpha" else all_parameter_lines),
             grid_override=local_grid,
+            sensitivity_file=(
+                None if parameter_name in ("vmic", "alpha") else {
+                    "metallicity": config.metallicity_sensitivity_file,
+                    "logg": config.logg_sensitivity_file,
+                    "teff": config.teff_sensitivity_file,
+                }[parameter_name]
+            ),
         )
 
-        full_grid = parameter_grid(config, parameter_name)
-        center_index = int(np.argmin(np.abs(full_grid - float(pass1_rounded))))
-        neighbor_steps: List[float] = []
-        if center_index > 0:
-            neighbor_steps.append(
-                abs(float(full_grid[center_index]) - float(full_grid[center_index - 1]))
-            )
-        if center_index < len(full_grid) - 1:
-            neighbor_steps.append(
-                abs(float(full_grid[center_index + 1]) - float(full_grid[center_index]))
-            )
-        if not neighbor_steps:
-            raise RuntimeError(
-                f"Cannot determine one-grid-step consistency limit for {parameter_name}."
-            )
-        one_grid_step = float(min(neighbor_steps))
+        # Record the absolute Pass-1-to-Pass-2 refinement shift for diagnostics.
+        # This quantity is not an acceptance criterion: every finite Pass-2
+        # solution is accepted and propagated to the next Pass-2 parameter.
+        # Only an invalid/non-finite Pass-2 solution falls back to Pass 1.
+        if np.isfinite(pass2_real):
+            refinement_shift = abs(float(pass2_real) - float(pass1_rounded))
+        else:
+            refinement_shift = np.inf
+        parameter_consistency_shifts[parameter_name] = refinement_shift
 
         if np.isfinite(pass2_real):
-            consistency_shift = abs(float(pass2_real) - float(pass1_rounded))
-        else:
-            consistency_shift = np.inf
-        parameter_consistency_shifts[parameter_name] = consistency_shift
-
-        pass2_consistent = (
-            np.isfinite(pass2_real)
-            and consistency_shift <= one_grid_step + 1.0e-10
-        )
-
-        if pass2_consistent:
             current = current_after_pass2
             parameter_errors[parameter_name] = pass2_error
             real_parameter_values[parameter_name] = pass2_real
             LOGGER.info(
                 "PASS-2 ACCEPTED | iteration %d.2 | %s | Pass-1 rounded=%s | "
-                "Pass-2 real=%.6f | shift=%.6f <= one grid step %.6f | "
-                "using Pass-2 error=%s",
+                "Pass-2 real=%.6f | refinement shift=%.6f | using Pass-2 error=%s",
                 iteration_id,
                 parameter_name,
                 pass1_rounded_string,
                 float(pass2_real),
-                consistency_shift,
-                one_grid_step,
+                refinement_shift,
                 "nan" if not np.isfinite(pass2_error) else f"{pass2_error:.6f}",
             )
         else:
-            # Keep all already accepted Pass-2 updates for the OTHER parameters,
-            # but restore this parameter itself to its rounded Pass-1 value.
+            # Preserve all already accepted Pass-2 updates for the other parameters,
+            # but restore this failed parameter itself to its rounded Pass-1 value.
             current = update_one_stellar_parameter(
                 current_after_pass2,
                 parameter_name,
@@ -4755,31 +5297,24 @@ def gj205_parameter_refiner(
             parameter_errors[parameter_name] = pass1_error
             real_parameter_values[parameter_name] = pass1_real
             LOGGER.warning(
-                "PASS-2 INCONSISTENT | iteration %d.2 | %s | Pass-1 rounded=%s | "
-                "Pass-2 real=%s | shift=%s > one grid step %.6f | "
-                "REVERTING TO PASS-1 value/error (real=%.6f, error=%s)",
+                "PASS-2 INVALID | iteration %d.2 | %s | Pass-1 rounded=%s | "
+                "Pass-2 real is non-finite | FALLING BACK TO PASS-1 value/error "
+                "(real=%.6f, error=%s)",
                 iteration_id,
                 parameter_name,
                 pass1_rounded_string,
-                "nan" if not np.isfinite(pass2_real) else f"{pass2_real:.6f}",
-                "nan" if not np.isfinite(consistency_shift) else f"{consistency_shift:.6f}",
-                one_grid_step,
                 float(pass1_real),
                 "nan" if not np.isfinite(pass1_error) else f"{pass1_error:.6f}",
             )
 
         checkpoint_step(step_name)
 
-    converged = parameter_change_is_converged(starting_parameters, current, config)
+    converged = parameter_change_is_converged(starting_parameters, current, config, iteration_id)
     note = (
-        "Two-pass sequential GJ205 refinement. Pass 1 uses the original "
+        "Two-pass sequential GJ205 refinement. Pass 1 uses the target-specific "
         "diagnostic-line strategy; Pass 2 repeats vmic -> [M/H] -> logg -> "
-        "Teff over all parameter lines on five-point local grids restricted "
-        "to the Pass-1 parameter grids. [alpha/Fe] remains fixed at its "
-        "original input value. Pass 2 is accepted only "
-        "when its fitted value remains within one original grid step of the "
-        "rounded Pass-1 center; otherwise that parameter retains its Pass-1 "
-        "value and Pass-1 uncertainty. Each sub-step uses the most recently "
+        "Teff -> [alpha/Fe] on local grids of up to five points restricted "
+        "to the Pass-1 parameter grids. [alpha/Fe] uses only selected alpha-element lines. Every finite Pass-2 result is accepted and propagated; only a non-finite Pass-2 result falls back to its Pass-1 value and uncertainty. Each sub-step uses the most recently "
         "updated fixed parameters."
     )
 
@@ -4887,6 +5422,57 @@ def run_fixed_atmosphere_abundance_solution(
     return np.asarray([result.mean_abundance for result in results], dtype=float)
 
 
+def run_final_dedicated_abundance_solution(
+    stellar_parameters: StellarParameters,
+    fixed_seed_abundances: np.ndarray,
+    species: SpeciesConfig,
+    line_lists: List[LineList],
+    lam_star: np.ndarray,
+    flux_star: np.ndarray,
+    err_flux_star: np.ndarray,
+    config: AutoSpecFitConfig,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run the dedicated final abundance-only fit at the accepted atmosphere.
+
+    Every target element is independently varied over the standard ASF-offset
+    grid while all non-target elements are held to the SAME finalized iterative
+    background vector. The background is not updated between target fits.
+    """
+    seed = np.asarray(fixed_seed_abundances, dtype=float)
+    if len(seed) != species.n_species or not np.all(np.isfinite(seed)):
+        raise ValueError("Dedicated final abundance seed must be finite for every species.")
+    fixed_strings = [format_abundance_filename_value(value) for value in seed]
+    model_paths = followup_iteration_model_paths(config, stellar_parameters, species, fixed_strings)
+    commands = followup_iteration_turbospectrum_commands(
+        config=config, stellar_parameters=stellar_parameters, species=species,
+        previous_abundance_strings=fixed_strings,
+    )
+    missing = require_models_or_ts_enabled(
+        model_paths, config.run_turbospectrum, "FINAL DEDICATED ABUNDANCE PASS"
+    )
+    if config.run_turbospectrum:
+        runner = select_turbospectrum_runner(stellar_parameters, config)
+        if missing:
+            LOGGER.info("FINAL DEDICATED ABUNDANCE PASS: %d model(s) missing/empty; submitting TS.", len(missing))
+        for command in commands:
+            run_turbospectrum_command(command=command, runner=runner, execution_prefix=config.turbospectrum_execution_prefix)
+    wait_for_model_files(model_paths, config)
+    abundance_grid = np.asarray(config.abundance_values, dtype=float)
+    results: List[SpeciesIterationResult] = []
+    for species_index in range(species.n_species):
+        results.append(fit_species_in_iteration(
+            iteration_id=0, species_index=species_index, species=species,
+            line_list=line_lists[species_index], species_model_paths=model_paths[species_index],
+            lam_star=lam_star, flux_star=flux_star, err_flux_star=err_flux_star,
+            config=config, abundance_grid=abundance_grid, log_handle=None,
+            log_context="FINAL DEDICATED ABUNDANCE PASS",
+        ))
+    refined = np.asarray([r.mean_abundance for r in results], dtype=float)
+    rounded = np.asarray([r.rounded_mean_abundance for r in results], dtype=float)
+    random_errors = species_abundance_errors_from_iteration(results)
+    return refined, rounded, random_errors
+
+
 def parameter_numeric_value(
     stellar_parameters: StellarParameters,
     parameter_name: str,
@@ -4900,98 +5486,6 @@ def parameter_numeric_value(
         "vmic": "vmic",
     }[parameter_name]
     return float(getattr(stellar_parameters, attr))
-
-
-def run_final_dedicated_abundance_solution(
-    stellar_parameters: StellarParameters,
-    fixed_seed_abundances: np.ndarray,
-    species: SpeciesConfig,
-    line_lists: List[LineList],
-    lam_star: np.ndarray,
-    flux_star: np.ndarray,
-    err_flux_star: np.ndarray,
-    config: AutoSpecFitConfig,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run one final abundance-only ASF pass at the accepted fixed atmosphere.
-
-    Every target element is varied once over the standard ASF-offset grid while
-    all non-target elements are held to the same finalized seed pattern. This
-    pass is deliberately performed after atmospheric-parameter convergence so
-    the reported final ASF offsets are all measured against one common final
-    atmosphere and one common background abundance pattern.
-
-    Returns
-    -------
-    refined_offsets
-        Continuous species-level ASF offsets from the dedicated pass.
-    rounded_offsets
-        Refined ASF offsets rounded to 0.001 dex for reporting/model naming.
-    random_errors
-        Random abundance uncertainties calculated from the dedicated line fits.
-    """
-    seed = np.asarray(fixed_seed_abundances, dtype=float)
-    if len(seed) != species.n_species or not np.all(np.isfinite(seed)):
-        raise ValueError(
-            "Final dedicated abundance seed must contain one finite ASF offset "
-            "for every species."
-        )
-
-    fixed_strings = [format_abundance_filename_value(value) for value in seed]
-    model_paths = followup_iteration_model_paths(
-        config, stellar_parameters, species, fixed_strings
-    )
-    commands = followup_iteration_turbospectrum_commands(
-        config=config,
-        stellar_parameters=stellar_parameters,
-        species=species,
-        previous_abundance_strings=fixed_strings,
-    )
-
-    missing_before_submission = require_models_or_ts_enabled(
-        model_paths,
-        config.run_turbospectrum,
-        "FINAL DEDICATED ABUNDANCE PASS",
-    )
-    if config.run_turbospectrum:
-        runner = select_turbospectrum_runner(stellar_parameters, config)
-        if missing_before_submission:
-            LOGGER.info(
-                "FINAL DEDICATED ABUNDANCE PASS: %d required model(s) are missing "
-                "or empty; submitting Turbospectrum.",
-                len(missing_before_submission),
-            )
-        for command in commands:
-            run_turbospectrum_command(
-                command=command,
-                runner=runner,
-                execution_prefix=config.turbospectrum_execution_prefix,
-            )
-
-    wait_for_model_files(model_paths, config)
-    abundance_grid = np.asarray(config.abundance_values, dtype=float)
-    results: List[SpeciesIterationResult] = []
-    for species_index in range(species.n_species):
-        results.append(
-            fit_species_in_iteration(
-                iteration_id=0,
-                species_index=species_index,
-                species=species,
-                line_list=line_lists[species_index],
-                species_model_paths=model_paths[species_index],
-                lam_star=lam_star,
-                flux_star=flux_star,
-                err_flux_star=err_flux_star,
-                config=config,
-                abundance_grid=abundance_grid,
-                log_handle=None,
-                log_context="FINAL DEDICATED ABUNDANCE PASS",
-            )
-        )
-
-    refined = np.asarray([result.mean_abundance for result in results], dtype=float)
-    rounded = np.asarray([result.rounded_mean_abundance for result in results], dtype=float)
-    random_errors = species_abundance_errors_from_iteration(results)
-    return refined, rounded, random_errors
 
 
 def run_systematic_abundance_error_analysis(
@@ -5033,9 +5527,9 @@ def run_systematic_abundance_error_analysis(
     )
     assert_canonical_stellar_parameter_strings(final_stellar_parameters)
 
-    # [alpha/Fe] is fixed at its original input value and therefore has no
-    # fitted uncertainty or systematic perturbation here.
-    parameter_names = ("vmic", "metallicity", "logg", "teff")
+    # All five fitted atmospheric parameters, including [alpha/Fe], contribute
+    # to the systematic abundance-error propagation.
+    parameter_names = ("vmic", "metallicity", "logg", "teff", "alpha")
     final_abundances = np.asarray(final_abundances, dtype=float)
     random_errors = np.asarray(random_abundance_errors, dtype=float)
 
@@ -5043,7 +5537,7 @@ def run_systematic_abundance_error_analysis(
     # For uncertainty propagation, compare PHYSICAL [X/H] abundances.  This is
     # essential for [M/H] perturbations because metallicity enters the
     # abundance-scale conversion directly in addition to changing the fitted
-    # ASF offset. The fixed alpha value remains unchanged in every conversion.
+    # ASF offset. The fitted alpha value is varied consistently in the alpha perturbations.
     nominal_xh = convert_asf_offsets_to_xh(
         final_abundances, final_stellar_parameters, species, config
     )
@@ -5146,26 +5640,17 @@ def run_systematic_abundance_error_analysis(
                 "alpha": "[alpha/Fe]",
             }
 
-            if parameter_name == "teff":
-                systematic_log_context = (
-                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
-                    f"{float(rounded_value):.0f} K"
-                )
-            elif parameter_name == "vmic":
-                systematic_log_context = (
-                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
-                    f"{float(rounded_value):.2f} km/s"
-                )
-            elif parameter_name in ("metallicity", "alpha"):
-                systematic_log_context = (
-                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
-                    f"{float(rounded_value):+.2f}"
-                )
-            else:
-                systematic_log_context = (
-                    f"SYSTEMATIC {parameter_display_names[parameter_name]}="
-                    f"{float(rounded_value):.2f}"
-                )
+            systematic_log_context = (
+                f"SYSTEMATIC | parameter={parameter_display_names[parameter_name]} | side={sign_label} | "
+                f"nominal={nominal_value:.6f} | sigma={sigma:.6f} | requested={requested_value:.6f} | "
+                f"examined_grid_value={float(rounded_value):.6f}"
+            )
+            LOGGER.info(
+                "%s | actual_displacement=%.6f | scale_to_1sigma=%.6f",
+                systematic_log_context,
+                abs(float(rounded_value)-nominal_value),
+                (sigma/abs(float(rounded_value)-nominal_value) if abs(float(rounded_value)-nominal_value) > 0 else np.nan),
+            )
 
             perturbed_abundances = run_fixed_atmosphere_abundance_solution(
                 label=f"{parameter_name}_{sign_label}_{rounded_string}",
@@ -5240,7 +5725,7 @@ def run_systematic_abundance_error_analysis(
     )
 
     # The final abundance table is the authoritative uncertainty product.
-    # Per-parameter consistency contributions remain available in memory but are
+    # Per-parameter Pass-1-to-Pass-2 refinement shifts remain available in memory but are
     # not written to separate files.
     return systematic_total, total_error, per_parameter
 
@@ -5262,7 +5747,7 @@ def perform_parameter_refinement(
     """Run the user-supplied atmospheric-parameter optimizer.
 
     The callback can implement the preferred scientific strategy (for example,
-    sequential [M/H] -> Teff -> log g refinement, or a joint Teff-log g fit).
+    sequential vmic -> [M/H] -> log g -> Teff refinement, or another target-appropriate strategy).
     It receives the abundances from the just-completed iteration so parameter
     models can be synthesized with the current chemical solution.
     """
@@ -5304,7 +5789,9 @@ def run_autospecfit_abundance_pipeline(
 ) -> None:
     """Run ASF with automatic iteration/sub-step checkpoint and restart support."""
 
+    pipeline_start_time = time.perf_counter()
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("ASF PIPELINE TIMER START | elapsed=%s", _format_elapsed(time.perf_counter() - pipeline_start_time))
 
     if config.refine_parameters_after_each_iteration and parameter_refiner is None:
         raise ValueError(
@@ -5343,6 +5830,7 @@ def run_autospecfit_abundance_pipeline(
         "logg": np.nan,
         "metallicity": np.nan,
         "vmic": np.nan,
+        "alpha": np.nan,
     }
     last_real_parameter_values: Dict[str, float] = {
         "teff": float(stellar_parameters.teff),
@@ -5356,6 +5844,7 @@ def run_autospecfit_abundance_pipeline(
         "logg": np.nan,
         "metallicity": np.nan,
         "vmic": np.nan,
+        "alpha": np.nan,
     }
     current_abundance_errors = np.full(species.n_species, np.nan)
     nan_replacement_notes: List[str] = []
@@ -5367,6 +5856,11 @@ def run_autospecfit_abundance_pipeline(
         config=config,
         species=species,
         n_total_iterations=n_total_iterations,
+    )
+    checkpoint = apply_one_time_iteration_rewind(
+        config=config,
+        checkpoint=checkpoint,
+        species=species,
     )
 
     if checkpoint is None:
@@ -5396,23 +5890,13 @@ def run_autospecfit_abundance_pipeline(
                 checkpoint["current_stellar_parameters"]
             ),
         )
-        # Never inherit a previously fitted alpha value from an older restart.
-        current_stellar_parameters = update_one_stellar_parameter(
-            current_stellar_parameters,
-            "alpha",
-            float(stellar_parameters.alpha),
-            use_exact_grid_format=True,
-        )
         mean_history = checkpoint["mean_history_array"]
         rounded_history = checkpoint["rounded_history_array"]
         last_parameter_errors.update(checkpoint["parameter_errors_dict"])
-        last_parameter_errors.pop("alpha", None)
         last_real_parameter_values.update(checkpoint["real_parameter_values_dict"])
-        last_real_parameter_values["alpha"] = float(stellar_parameters.alpha)
         last_parameter_consistency_shifts.update(
             checkpoint.get("parameter_consistency_shifts_dict", {})
         )
-        last_parameter_consistency_shifts.pop("alpha", None)
         if len(checkpoint["abundance_errors_array"]) == species.n_species:
             current_abundance_errors = checkpoint["abundance_errors_array"]
         parameter_converged_for_next_iteration = bool(
@@ -5481,9 +5965,13 @@ def run_autospecfit_abundance_pipeline(
     log_path = Path(config.output_dir) / config.iteration_log_file
 
     with open(log_path, log_mode, buffering=1) as log_handle:
+        LOGGER.info(
+            "CHI2 DEFINITION | chi2 = sum((F_obs_norm - F_model)^2 / "
+            "(sigma_obs_norm^2 + delta_norm^2)) over fitted pixels"
+        )
         if log_mode == "w":
             log_handle.write(
-                "LineCenter BestFit_Abundance_PolyFit BestFit_Abundance_Original\n"
+                "LineCenter BestFit_ASF_Offset_PolyFit BestFit_ASF_Offset_Grid\n"
             )
             log_handle.write(
                 "==================================================================\n"
@@ -5494,12 +5982,20 @@ def run_autospecfit_abundance_pipeline(
             )
             log_handle.flush()
 
+        # Wall-clock timers for complete matched ASF iterations.  For N>=2 the
+        # timer starts when parameter iteration N begins and stops after abundance
+        # iteration N reaches its convergence check.
+        iteration_cycle_start_times: Dict[int, float] = {}
+
         while iteration_id <= n_total_iterations:
 
             # -------------------------------------------------------------
             # STAGE 1: ABUNDANCE ITERATION
             # -------------------------------------------------------------
             if next_stage == "abundance":
+                if iteration_id not in iteration_cycle_start_times:
+                    iteration_cycle_start_times[iteration_id] = time.perf_counter()
+                    LOGGER.info("ITERATION TIMER START | iteration %d", iteration_id)
                 LOGGER.info("Starting AutoSpecFit-Abund iteration %d", iteration_id)
 
                 if iteration_id == 1:
@@ -5626,7 +6122,7 @@ def run_autospecfit_abundance_pipeline(
                     last_parameter_errors=last_parameter_errors,
                     last_real_parameter_values=last_real_parameter_values,
                     abundance_errors=current_abundance_errors,
-                    parameter_converged_for_next_iteration=True,
+                    parameter_converged_for_next_iteration=parameter_converged_for_next_iteration,
                     nan_replacement_notes=nan_replacement_notes,
                     last_parameter_consistency_shifts=last_parameter_consistency_shifts,
                 )
@@ -5640,6 +6136,12 @@ def run_autospecfit_abundance_pipeline(
                 # identified as parameter iteration N+1 and used for abundance
                 # iteration N+1.
                 parameter_iteration_id = iteration_id + 1
+                if parameter_iteration_id not in iteration_cycle_start_times:
+                    iteration_cycle_start_times[parameter_iteration_id] = time.perf_counter()
+                    LOGGER.info(
+                        "ITERATION TIMER START | iteration %d | parameter refinement begins",
+                        parameter_iteration_id,
+                    )
 
                 refinement = perform_parameter_refinement(
                     parameter_refiner=parameter_refiner,
@@ -5658,25 +6160,11 @@ def run_autospecfit_abundance_pipeline(
                     config=config,
                 )
 
-                # Enforce the fixed-alpha policy even for a user-supplied
-                # parameter-refiner callback or a legacy callback that still
-                # attempts to return a different alpha value/error.
-                refinement.stellar_parameters = update_one_stellar_parameter(
-                    refinement.stellar_parameters,
-                    "alpha",
-                    float(stellar_parameters.alpha),
-                    use_exact_grid_format=True,
-                )
-                refinement.parameter_errors.pop("alpha", None)
-                refinement.parameter_consistency_shifts.pop("alpha", None)
-                refinement.real_parameter_values["alpha"] = float(
-                    stellar_parameters.alpha
-                )
-
                 change_converged = parameter_change_is_converged(
                     used_parameters,
                     refinement.stellar_parameters,
                     config,
+                    parameter_iteration_id,
                 )
                 parameter_converged_for_next_iteration = bool(
                     refinement.converged or change_converged
@@ -5721,7 +6209,7 @@ def run_autospecfit_abundance_pipeline(
                 LOGGER.info(
                     "Parameter iteration %d, produced after abundance iteration %d: "
                     "vmic %s -> %s, [M/H] %s -> %s, logg %s -> %s, "
-                    "Teff %s -> %s; fixed [alpha/Fe]=%s",
+                    "Teff %s -> %s; fitted [alpha/Fe]=%s",
                     parameter_iteration_id,
                     iteration_id,
                     used_parameters.vmic,
@@ -5760,10 +6248,15 @@ def run_autospecfit_abundance_pipeline(
             # -------------------------------------------------------------
             if next_stage == "convergence":
 
-                # Iteration 1 is never the final abundance convergence comparison.
+                # P_1 was fitted before A_1. There is still no previous abundance
+                # iteration for an abundance-convergence comparison, so create P_2
+                # from A_1 before running A_2.
                 if iteration_id == 1:
-                    iteration_id = 2
-                    next_stage = "abundance"
+                    if config.refine_parameters_after_each_iteration:
+                        next_stage = "parameter"
+                    else:
+                        iteration_id = 2
+                        next_stage = "abundance"
                     save_restart_checkpoint(
                         config,
                         next_stage=next_stage,
@@ -5778,6 +6271,16 @@ def run_autospecfit_abundance_pipeline(
                         nan_replacement_notes=nan_replacement_notes,
                         last_parameter_consistency_shifts=last_parameter_consistency_shifts,
                     )
+                    start_time = iteration_cycle_start_times.pop(iteration_id, None)
+                    if start_time is not None:
+                        elapsed_seconds = time.perf_counter() - start_time
+                        timer_note = (
+                            f"ITERATION TIMER END | iteration {iteration_id} | "
+                            f"elapsed={elapsed_seconds:.1f} s ({elapsed_seconds / 3600.0:.3f} h)"
+                        )
+                        LOGGER.info(timer_note)
+                        log_handle.write(f"# {timer_note}\n")
+                        log_handle.flush()
                     continue
 
                 change = np.abs(
@@ -5817,12 +6320,14 @@ def run_autospecfit_abundance_pipeline(
 
                 if forced_final_iteration:
                     convergence_mode = "maximum-iteration finalization"
-                    # At the hard stop, use the nominal final-stage 0.10 dex
-                    # tolerance. NaN changes do not count as non-convergence.
+                    # At iteration 15 the active nominal tolerance is 0.10 dex.
+                    # Recompute the replacement set so every finite species still
+                    # above the final-stage tolerance receives the late-history median.
                     active_tolerance = config.final_convergence_tolerance
+                    comparison_epsilon = 0.0049
                     non_converged_indices = np.where(
                         np.isfinite(change)
-                        & (change > active_tolerance + ABUNDANCE_CONVERGENCE_MARGIN)
+                        & (change > active_tolerance + comparison_epsilon)
                     )[0].astype(int).tolist()
                     decision = (
                         "FINALIZE AT MAXIMUM ITERATION WITHOUT FULL CONVERGENCE"
@@ -5859,6 +6364,18 @@ def run_autospecfit_abundance_pipeline(
                 log_handle.write(f"# {convergence_check_note}\n")
                 log_handle.flush()
 
+                start_time = iteration_cycle_start_times.pop(iteration_id, None)
+                if start_time is not None:
+                    elapsed_seconds = time.perf_counter() - start_time
+                    elapsed_hours = elapsed_seconds / 3600.0
+                    timer_note = (
+                        f"ITERATION TIMER END | iteration {iteration_id} | "
+                        f"elapsed={elapsed_seconds:.1f} s ({elapsed_hours:.3f} h)"
+                    )
+                    LOGGER.info(timer_note)
+                    log_handle.write(f"# {timer_note}\n")
+                    log_handle.flush()
+
                 if finalize_now:
                     final_not_rounded = mean_history[:, iteration_id - 1].copy()
                     final_rounded = rounded_history[:, iteration_id - 1].copy()
@@ -5867,13 +6384,13 @@ def run_autospecfit_abundance_pipeline(
                         if forced_final_iteration:
                             context = (
                                 f"did not satisfy the final convergence tolerance "
-                                f"({active_tolerance:.3f} dex) at the maximum iteration"
+                                f"({active_tolerance:.2f} dex) at the maximum iteration"
                             )
                         else:
                             context = (
                                 f"was treated as oscillating under the "
                                 f"{convergence_mode} criterion "
-                                f"({active_tolerance:.3f} dex)"
+                                f"({active_tolerance:.2f} dex)"
                             )
 
                         apply_late_history_statistics(
@@ -5935,7 +6452,7 @@ def run_autospecfit_abundance_pipeline(
                     )
 
                     # Run one final dedicated abundance-only pass at the accepted
-                    # atmosphere. Build one common finite ASF-offset seed pattern.
+                    # atmosphere.  Build one common finite ASF-offset seed pattern.
                     # If a finalized species is NaN, use its most recent finite
                     # rounded ASF offset from the iterative history only as the fixed
                     # background seed; the target itself is still refitted normally.
@@ -5980,9 +6497,8 @@ def run_autospecfit_abundance_pipeline(
                         config=config,
                     )
 
-                    # Propagate the final atmospheric-parameter uncertainties around
-                    # the DEDICATED final ASF-offset solution. The dedicated random
-                    # errors are also used in the final total-error calculation.
+                    # Propagate the already determined final atmospheric-parameter
+                    # uncertainties around the DEDICATED final ASF-offset solution.
                     (
                         systematic_errors,
                         total_abundance_errors,
@@ -6060,10 +6576,9 @@ def run_autospecfit_abundance_pipeline(
 
 if __name__ == "__main__":
     CONFIG = AutoSpecFitConfig(
-        # The original iteration-1 abundance models already exist. Skip TS
-        # only for abundance iteration 1; later iterations use the global
-        # run_turbospectrum=True setting.
-        run_ts_by_iteration={1: False},
+        # Turbospectrum follows the global run_turbospectrum=True setting
+        # for every abundance and parameter iteration, with no per-iteration skips.
+        run_ts_by_iteration={},
         run_parameter_ts_by_iteration={},
         refine_parameters_after_each_iteration=True,
     )
