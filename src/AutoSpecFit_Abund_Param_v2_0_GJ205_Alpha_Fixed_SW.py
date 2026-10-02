@@ -507,22 +507,34 @@ class AutoSpecFitConfig:
     # target-specific refiner and can be adapted for other targets.
     refine_parameters_after_each_iteration: bool = True
 
-    # File containing all parameter-diagnostic lines. Expected columns:
+    # Optional Pass 1 diagnostic-line stage.
+    # True  -> run the established diagnostic-line Pass 1, followed by the
+    #          local broader-line refinement.
+    # False -> skip Pass 1 entirely and run direct local parameter refinement
+    #          with the broader selected line set. In this mode the Pass-1
+    #          diagnostic-line tuples below are ignored and do not need to be
+    #          defined for a new target.
+    run_parameter_pass1: bool = True
+
+    # File containing the selected parameter-analysis lines. Expected columns:
     # Line_num Species line_center RV min_fit max_fit
     parameter_line_file: Path = Path("All_Species_Fit_Ranges_GJ205.txt")
     metallicity_sensitivity_file: Path = SCRIPT_DIR / "GJ205_Metal_Sensitivity_MetalMin-0.40_MetalMax+0.40_Teff3700_Grav+4.7.txt"
     logg_sensitivity_file: Path = SCRIPT_DIR / "GJ205_Logg_Sensitivity_GravMin+4.5_GravMax+5.5_Teff3700_Metal+0.10.txt"
     teff_sensitivity_file: Path = SCRIPT_DIR / "GJ205_Teff_Sensitivity_TeffMin3500_TeffMax3900_Metal+0.10_Grav+4.7.txt"
 
-    # Example Pass-1 diagnostic-line selections (1-based, matching
-    # parameter_line_file). For general use, define parameter-specific subsets
+    # Optional Pass-1 diagnostic-line selections (1-based, matching
+    # parameter_line_file). These are used only when run_parameter_pass1=True.
+    # When Pass 1 is disabled they are ignored, so users without established
+    # diagnostic subsets do not need to replace them. For Pass-1 use, define
+    # parameter-specific subsets
     # according to the strength and distinctiveness of the diagnostic lines for
     # the target. If a suitable subset cannot be identified for a parameter, use
     # the full selected parameter-line list and place that parameter last among
     # [M/H], log g, and Teff. The values below are the supplied example settings.
-    metallicity_diagnostic_lines: Tuple[int, ...] = (12, 13, 65, 66, 68)
-    logg_diagnostic_lines: Tuple[int, ...] = (65, 66, 68)
-    teff_diagnostic_lines: Tuple[int, ...] = (1, 2, 3, 22, 48, 49, 52, 53, 55, 97)
+    metallicity_diagnostic_lines: Optional[Tuple[int, ...]] = (12, 13, 65, 66, 68)
+    logg_diagnostic_lines: Optional[Tuple[int, ...]] = (65, 66, 68)
+    teff_diagnostic_lines: Optional[Tuple[int, ...]] = (1, 2, 3, 22, 48, 49, 52, 53, 55, 97)
 
     # vmic is fitted with every line listed in parameter_line_file in both
     # parameter passes.
@@ -2673,7 +2685,7 @@ def apply_one_time_iteration_rewind(
         (config.parameter_history_file, [
             "# Cumulative atmospheric-parameter history for GJ205",
             "# Each iteration is listed below the previous iteration; values are native ASF offsets (dex).",
-            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and absolute Pass-1-to-Pass-2 refinement shift.",
+            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and absolute local refinement shift.",
         ]),
         (config.convergence_history_file, [
             "# Cumulative combined convergence history for GJ205",
@@ -2762,8 +2774,9 @@ def save_parameter_progress(
 ) -> None:
     """Checkpoint the sequential vmic -> [M/H] -> log g -> Teff refinement."""
     payload = {
-        "version": 1,
+        "version": 2,
         "iteration_id": int(iteration_id),
+        "run_parameter_pass1": bool(config.run_parameter_pass1),
         "completed_steps": list(completed_steps),
         "starting_parameters": stellar_parameters_to_dict(starting_parameters),
         "current_parameters": stellar_parameters_to_dict(current_parameters),
@@ -2809,9 +2822,18 @@ def load_parameter_progress(
         )
     payload = json.loads(content)
 
-    if int(payload.get("version", 0)) != 1:
+    version = int(payload.get("version", 0))
+    if version not in (1, 2):
         return None
     if int(payload.get("iteration_id", -1)) != int(iteration_id):
+        return None
+    saved_mode = payload.get("run_parameter_pass1", True if version == 1 else None)
+    if saved_mode is None or bool(saved_mode) != bool(config.run_parameter_pass1):
+        LOGGER.warning(
+            "Ignoring parameter-progress checkpoint for iteration %d because "
+            "its Pass-1 mode differs from the current configuration.",
+            iteration_id,
+        )
         return None
 
     # Protect against accidentally reusing a checkpoint from a different
@@ -3112,13 +3134,18 @@ def update_parameter_history_table(
                     prefix = f"Iteration_{old_iteration}"
                     block = [
                         f"Iteration {old_iteration}",
-                        "Parameter   Real_Value   Rounded_Value   Random_Error   Pass1_to_Pass2_Difference",
+                        "Parameter   Real_Value   Rounded_Value   Random_Error   Refinement_Shift",
                     ]
                     for label in labels:
                         real_value = old_table.at[label, f"{prefix}_Real_Value"]
                         rounded_value = old_table.at[label, f"{prefix}_Rounded_Value"]
                         error = old_table.at[label, f"{prefix}_Random_Error"]
-                        difference = old_table.at[label, f"{prefix}_Pass1_to_Pass2_Difference"]
+                        difference_column = (
+                            f"{prefix}_Refinement_Shift"
+                            if f"{prefix}_Refinement_Shift" in old_table.columns
+                            else f"{prefix}_Pass1_to_Pass2_Difference"
+                        )
+                        difference = old_table.at[label, difference_column]
                         block.append(
                             f"{label:<12}   {_format_history_float(real_value):>10}   "
                             f"{_format_history_float(rounded_value):>13}   "
@@ -3131,7 +3158,7 @@ def update_parameter_history_table(
 
     block = [
         f"Iteration {iteration_id}",
-        "Parameter   Real_Value   Rounded_Value   Random_Error   Pass1_to_Pass2_Difference",
+        "Parameter   Real_Value   Rounded_Value   Random_Error   Refinement_Shift",
     ]
     for label, key, rounded_value in rows:
         block.append(
@@ -3147,7 +3174,7 @@ def update_parameter_history_table(
         [
             "# Cumulative atmospheric-parameter history for GJ205",
             "# Each iteration is listed below the previous iteration.",
-            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and absolute Pass-1-to-Pass-2 refinement shift.",
+            "# Columns give the accepted real value, propagated rounded value, 1-sigma random error, and absolute local refinement shift.",
         ],
         blocks,
     )
@@ -3681,8 +3708,9 @@ def local_parameter_grid(
     parameter_name: str,
     center_value: float,
     half_width: float,
+    mode_label: str = "PASS-2",
 ) -> np.ndarray:
-    """Return the local Pass-2 grid centered on the rounded Pass-1 solution.
+    """Return a local grid centered on the nearest adopted global-grid value.
 
     The continuous Pass-1 result is first rounded to the nearest Pass-1 grid
     value. Pass 2 then uses the existing Pass-1 grid points lying within two
@@ -3714,9 +3742,9 @@ def local_parameter_grid(
             f"obtained {local.tolist()}."
         )
     LOGGER.info(
-        "PASS-2 GRID | %s | Pass-1 real=%s | rounded center=%s | step=%g | "
-        "restricted_to_Pass1=[%s,%s] | n_points=%d | values=%s",
-        parameter_name, f"{float(center_value):.6f}", format_parameter_value(parameter_name, rounded_center), step,
+        "%s GRID | %s | input center=%s | rounded center=%s | step=%g | "
+        "restricted_to_global_grid=[%s,%s] | n_points=%d | values=%s",
+        mode_label, parameter_name, f"{float(center_value):.6f}", format_parameter_value(parameter_name, rounded_center), step,
         format_parameter_value(parameter_name, float(main_grid[0])), format_parameter_value(parameter_name, float(main_grid[-1])),
         len(local), ",".join(format_parameter_value(parameter_name, value) for value in local),
     )
@@ -4404,7 +4432,7 @@ def write_current_parameter_table(
         "Adopted_Grid_Value": [row[2] for row in labels],
         "Real_Value": [real_parameter_values.get(row[1], np.nan) for row in labels],
         "Random_Error": [parameter_errors.get(row[1], np.nan) for row in labels],
-        "Pass1_to_Pass2_Difference": [
+        "Refinement_Shift": [
             parameter_consistency_shifts.get(row[1], np.nan) for row in labels
         ],
     })
@@ -4426,9 +4454,9 @@ def write_final_parameter_table(
 ) -> None:
     """Write final stellar parameters with their random fitting errors only.
 
-    No Pass-1-to-Pass-2 shift or total error is reported because the Pass-1 to
-    Pass-2 change is a refinement diagnostic, not an independently
-    quantified systematic uncertainty.
+    No local refinement shift or total error is reported because the refinement
+    shift is a diagnostic quantity, not an independently quantified systematic
+    uncertainty.
     """
     labels = [
         ("Teff", "teff", "K"),
@@ -4913,7 +4941,8 @@ def run_one_parameter_refinement_step(
     if sensitivity_file is not None:
         sensitivity_values = read_parameter_sensitivity_file(sensitivity_file, selected_lines)
         LOGGER.info(
-            "PASS-2 SENSITIVITY WEIGHTING | iteration %d.%d | %s | file=%s | available lines=%d | positive total sensitivity=%.8g",
+            "%s SENSITIVITY WEIGHTING | iteration %d.%d | %s | file=%s | available lines=%d | positive total sensitivity=%.8g",
+            "DIRECT" if parameter_pass == 3 else "PASS-2",
             iteration_id, parameter_pass, parameter_name, sensitivity_file, selected_lines.n_lines, float(np.sum(sensitivity_values)),
         )
 
@@ -4939,7 +4968,7 @@ def run_one_parameter_refinement_step(
     )
 
     # The continuous parabolic best-fit value is retained as the REAL reported
-    # result and is used for the Pass-1-to-Pass-2 refinement-shift diagnostic and uncertainty.
+    # result and is used for the local refinement-shift diagnostic and uncertainty.
     #
     # Before ANY result is propagated to the next parameter/abundance step,
     # however, it is rounded to the appropriate synthesis grid.  Pass 1 rounds
@@ -4948,7 +4977,7 @@ def run_one_parameter_refinement_step(
     # the selected Pass-1 range. Thus the scientific fit remains continuous,
     # while every atmosphere/synthetic-spectrum calculation receives a grid-
     # compatible parameter value.
-    if parameter_pass == 2 and grid_override is not None:
+    if parameter_pass in (2, 3) and grid_override is not None:
         propagation_grid = np.asarray(grid, dtype=float)
         propagation_index = int(
             np.argmin(np.abs(propagation_grid - float(adopted_value)))
@@ -5027,7 +5056,7 @@ def gj205_parameter_refiner(
     err_flux_star: np.ndarray,
     config: AutoSpecFitConfig,
 ) -> ParameterRefinementResult:
-    """Run the two-pass atmospheric-parameter refinement for the supplied example.
+    """Run optional-Pass-1 atmospheric-parameter refinement for this example.
 
     ASF v2.0 fits vmic first. The ordering of [M/H], log g, and Teff should be
     chosen for each target according to the availability, strength, and
@@ -5036,18 +5065,36 @@ def gj205_parameter_refiner(
     all selected parameter lines. [alpha/Fe] remains fixed at its original
     input value throughout the refinement.
 
-    Pass 1 follows the target-specific diagnostic-line strategy encoded below.
-    Pass 2 is a narrow verification/refinement around the Pass-1 result and uses
+    When run_parameter_pass1=True, Pass 1 follows the target-specific
+    diagnostic-line strategy encoded below. The subsequent local refinement uses
     all selected parameter lines in the same order as Pass 1: vmic, [M/H], log g,
     and Teff. Each fitted
     parameter uses the most recently updated atmosphere from the preceding
-    Pass-2 sub-step. Local grids
-    are subsets of the original grids, centered after rounding the Pass-1 result
-    to the nearest allowed global-grid value.
+    local-refinement sub-step. Local grids
+    are subsets of the original grids. When Pass 1 is disabled, the same local
+    refinement machinery is used directly, centered on the accepted atmospheric
+    value entering each sequential parameter sub-step; the Pass-1 diagnostic
+    selections are ignored.
     """
     del iteration_results, line_lists
 
     starting_parameters = stellar_parameters
+    if config.run_parameter_pass1:
+        missing_diagnostics = [
+            name for name, values in (
+                ("metallicity", config.metallicity_diagnostic_lines),
+                ("logg", config.logg_diagnostic_lines),
+                ("teff", config.teff_diagnostic_lines),
+            )
+            if values is None or len(values) == 0
+        ]
+        if missing_diagnostics:
+            raise ValueError(
+                "Pass 1 is enabled, but no diagnostic-line subset is defined for: "
+                + ", ".join(missing_diagnostics)
+                + ". Define those subsets or set run_parameter_pass1=False."
+            )
+
     all_parameter_lines = select_available_parameter_lines(
         read_parameter_diagnostic_lines(config.parameter_line_file)
     )
@@ -5115,7 +5162,7 @@ def gj205_parameter_refiner(
     def checkpoint_step(step_name: str) -> None:
         if step_name not in completed_steps:
             completed_steps.append(step_name)
-        pass_number = 2 if step_name.startswith("p2_") else 1
+        pass_number = 3 if step_name.startswith("direct_") else (2 if step_name.startswith("p2_") else 1)
         write_current_parameter_table(
             iteration_id=iteration_id,
             parameter_pass=pass_number,
@@ -5182,19 +5229,35 @@ def gj205_parameter_refiner(
         first_pass_real_values[parameter_name] = real_value
         checkpoint_step(step_name)
 
-    # --------------------------- Pass 1 ---------------------------
-    run_pass1_step("p1_vmic", "vmic", selected_lines_override=available_parameter_lines)
-    run_pass1_step(
-        "p1_metallicity", "metallicity",
-        diagnostic_line_numbers=config.metallicity_diagnostic_lines,
-    )
-    run_pass1_step(
-        "p1_logg", "logg", diagnostic_line_numbers=config.logg_diagnostic_lines
-    )
-    run_pass1_step(
-        "p1_teff", "teff", diagnostic_line_numbers=config.teff_diagnostic_lines
-    )
-    # --------------------------- Pass 2 ---------------------------
+    # -------------------- Optional Pass 1 --------------------
+    if config.run_parameter_pass1:
+        LOGGER.info(
+            "PARAMETER REFINEMENT MODE | iteration %d | Pass 1 enabled: "
+            "diagnostic-line Pass 1 followed by local broader-line refinement",
+            iteration_id,
+        )
+        run_pass1_step("p1_vmic", "vmic", selected_lines_override=available_parameter_lines)
+        run_pass1_step(
+            "p1_metallicity", "metallicity",
+            diagnostic_line_numbers=config.metallicity_diagnostic_lines,
+        )
+        run_pass1_step(
+            "p1_logg", "logg", diagnostic_line_numbers=config.logg_diagnostic_lines
+        )
+        run_pass1_step(
+            "p1_teff", "teff", diagnostic_line_numbers=config.teff_diagnostic_lines
+        )
+    else:
+        LOGGER.info(
+            "PARAMETER REFINEMENT MODE | iteration %d | Pass 1 disabled: "
+            "diagnostic subsets ignored; using direct local broader-line refinement",
+            iteration_id,
+        )
+
+    # Local-grid spacing. With Pass 1 enabled, the local grid is centered on
+    # the continuous Pass-1 result rounded to the global grid. With Pass 1
+    # disabled, it is centered on the accepted atmospheric value entering the
+    # current parameter sub-step.
     half_widths = {
         "vmic": config.second_pass_vmic_half_width,
         "metallicity": config.second_pass_metallicity_half_width,
@@ -5203,49 +5266,58 @@ def gj205_parameter_refiner(
     }
 
     for parameter_name in keys:
-        step_name = f"p2_{parameter_name}"
+        direct_mode = not config.run_parameter_pass1
+        step_name = f"direct_{parameter_name}" if direct_mode else f"p2_{parameter_name}"
         if step_name in completed_steps:
             continue
 
-        # Pass 2 is anchored to the Pass-1 result for this same parameter.
-        # First round the continuous Pass-1 result to the nearest Pass-1/original
-        # grid value. Then select the existing Pass-1 grid points within two
-        # grid steps on either side. Near a Pass-1 boundary the local grid is
-        # truncated to three or four points rather than shifted or extended.
-        pass1_real = first_pass_real_values.get(parameter_name, np.nan)
-        if not np.isfinite(pass1_real):
-            raise RuntimeError(
-                f"Pass-2 {parameter_name} cannot start because its Pass-1 "
-                "continuous result is unavailable in the parameter checkpoint."
+        if direct_mode:
+            center_real = float(getattr(current, parameter_name))
+            center_rounded, center_string = round_parameter_to_nearest_grid(
+                config, parameter_name, center_real
             )
-        pass1_rounded, pass1_rounded_string = round_parameter_to_nearest_grid(
-            config, parameter_name, float(pass1_real)
-        )
-        LOGGER.info(
-            "PASS-2 CENTER | iteration %d.2 | %s | Pass-1 real=%.6f | "
-            "rounded center=%s | half-width=%g",
-            iteration_id,
-            parameter_name,
-            float(pass1_real),
-            pass1_rounded_string,
-            float(half_widths[parameter_name]),
-        )
+            fallback_error = float(parameter_errors.get(parameter_name, np.nan))
+            fallback_real = center_real
+            mode_label = "DIRECT"
+            parameter_pass = 3
+            LOGGER.info(
+                "DIRECT CENTER | iteration %d | %s | entering value=%.6f | "
+                "rounded center=%s | grid step=%g",
+                iteration_id, parameter_name, center_real, center_string,
+                float(half_widths[parameter_name]),
+            )
+        else:
+            center_real = first_pass_real_values.get(parameter_name, np.nan)
+            if not np.isfinite(center_real):
+                raise RuntimeError(
+                    f"Pass-2 {parameter_name} cannot start because its Pass-1 "
+                    "continuous result is unavailable in the parameter checkpoint."
+                )
+            center_rounded, center_string = round_parameter_to_nearest_grid(
+                config, parameter_name, float(center_real)
+            )
+            fallback_error = float(parameter_errors.get(parameter_name, np.nan))
+            fallback_real = float(center_real)
+            mode_label = "PASS-2"
+            parameter_pass = 2
+            LOGGER.info(
+                "PASS-2 CENTER | iteration %d.2 | %s | Pass-1 real=%.6f | "
+                "rounded center=%s | grid step=%g",
+                iteration_id, parameter_name, float(center_real), center_string,
+                float(half_widths[parameter_name]),
+            )
 
         local_grid = local_parameter_grid(
             config=config,
             parameter_name=parameter_name,
-            center_value=float(pass1_rounded),
+            center_value=float(center_rounded),
             half_width=float(half_widths[parameter_name]),
+            mode_label=mode_label,
         )
 
-        # Preserve the Pass-1 formal/random error before Pass 2 is evaluated.
-        # It is used only as the safe fallback if Pass 2 fails to return a
-        # finite solution; finite Pass-2 solutions are always accepted.
-        pass1_error = float(parameter_errors.get(parameter_name, np.nan))
-
-        current_after_pass2, pass2_error, pass2_real, _pass2_guard_rejected = run_one_parameter_refinement_step(
+        current_after_local, local_error, local_real, _guard_rejected = run_one_parameter_refinement_step(
             iteration_id=iteration_id,
-            parameter_pass=2,
+            parameter_pass=parameter_pass,
             parameter_name=parameter_name,
             diagnostic_line_numbers=None,
             stellar_parameters=current,
@@ -5266,63 +5338,55 @@ def gj205_parameter_refiner(
             ),
         )
 
-        # Record the absolute Pass-1-to-Pass-2 refinement shift for diagnostics.
-        # This quantity is not an acceptance criterion: every finite Pass-2
-        # solution is accepted and propagated to the next Pass-2 parameter.
-        # Only an invalid/non-finite Pass-2 solution falls back to Pass 1.
-        if np.isfinite(pass2_real):
-            refinement_shift = abs(float(pass2_real) - float(pass1_rounded))
+        if np.isfinite(local_real):
+            refinement_shift = abs(float(local_real) - float(center_rounded))
         else:
             refinement_shift = np.inf
         parameter_consistency_shifts[parameter_name] = refinement_shift
 
-        if np.isfinite(pass2_real):
-            current = current_after_pass2
-            parameter_errors[parameter_name] = pass2_error
-            real_parameter_values[parameter_name] = pass2_real
+        if np.isfinite(local_real):
+            current = current_after_local
+            parameter_errors[parameter_name] = local_error
+            real_parameter_values[parameter_name] = local_real
             LOGGER.info(
-                "PASS-2 ACCEPTED | iteration %d.2 | %s | Pass-1 rounded=%s | "
-                "Pass-2 real=%.6f | refinement shift=%.6f | using Pass-2 error=%s",
-                iteration_id,
-                parameter_name,
-                pass1_rounded_string,
-                float(pass2_real),
-                refinement_shift,
-                "nan" if not np.isfinite(pass2_error) else f"{pass2_error:.6f}",
+                "%s ACCEPTED | iteration %d.%d | %s | center=%s | "
+                "real=%.6f | refinement shift=%.6f | error=%s",
+                mode_label, iteration_id, parameter_pass, parameter_name,
+                center_string, float(local_real), refinement_shift,
+                "nan" if not np.isfinite(local_error) else f"{local_error:.6f}",
             )
         else:
-            # Preserve all already accepted Pass-2 updates for the other parameters,
-            # but restore this failed parameter itself to its rounded Pass-1 value.
+            # Preserve all previously accepted sequential updates, but restore
+            # this failed parameter to the value that entered its local step.
             current = update_one_stellar_parameter(
-                current_after_pass2,
+                current_after_local,
                 parameter_name,
-                float(pass1_rounded),
+                float(center_rounded),
                 use_exact_grid_format=True,
             )
-            parameter_errors[parameter_name] = pass1_error
-            real_parameter_values[parameter_name] = pass1_real
+            parameter_errors[parameter_name] = fallback_error
+            real_parameter_values[parameter_name] = fallback_real
             LOGGER.warning(
-                "PASS-2 INVALID | iteration %d.2 | %s | Pass-1 rounded=%s | "
-                "Pass-2 real is non-finite | FALLING BACK TO PASS-1 value/error "
-                "(real=%.6f, error=%s)",
-                iteration_id,
-                parameter_name,
-                pass1_rounded_string,
-                float(pass1_real),
-                "nan" if not np.isfinite(pass1_error) else f"{pass1_error:.6f}",
+                "%s INVALID | iteration %d.%d | %s | center=%s | "
+                "non-finite solution; retaining entering/Pass-1 value and error",
+                mode_label, iteration_id, parameter_pass, parameter_name, center_string,
             )
 
         checkpoint_step(step_name)
 
     converged = parameter_change_is_converged(starting_parameters, current, config, iteration_id)
-    note = (
-        "Two-pass sequential GJ205 refinement. Pass 1 uses the target-specific "
-        "diagnostic-line strategy; Pass 2 repeats vmic -> [M/H] -> logg -> "
-        "Teff over all parameter lines on local grids of up to five points restricted "
-        "to the Pass-1 parameter grids. [alpha/Fe] remains fixed at its "
-        "original input value. Every finite Pass-2 result is accepted and propagated; only a non-finite Pass-2 result falls back to its Pass-1 value and uncertainty. Each sub-step uses the most recently "
-        "updated fixed parameters."
-    )
+    if config.run_parameter_pass1:
+        note = (
+            "Sequential GJ205 refinement with optional Pass 1 enabled. Pass 1 uses "
+            "the target-specific diagnostic-line strategy; the subsequent local "
+            "refinement follows vmic -> [M/H] -> logg -> Teff. [alpha/Fe] remains fixed at its original input value."
+        )
+    else:
+        note = (
+            "Sequential GJ205 direct local refinement with Pass 1 disabled. "
+            "Pass-1 diagnostic subsets are ignored and the broader selected line "
+            "set is used directly in the order vmic -> [M/H] -> logg -> Teff. [alpha/Fe] remains fixed at its original input value."
+        )
 
     return ParameterRefinementResult(
         stellar_parameters=current,
