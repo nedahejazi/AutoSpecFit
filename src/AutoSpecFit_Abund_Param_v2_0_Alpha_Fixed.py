@@ -2202,96 +2202,124 @@ def evaluate_convergence_status(
     change: np.ndarray,
     iteration_id: int,
     config: AutoSpecFitConfig,
+    mean_history: Optional[np.ndarray] = None,
 ) -> Tuple[bool, List[int], float, str]:
-    """Evaluate staged ASF abundance convergence for the current iteration.
+    """Evaluate the staged ASF abundance-convergence criterion.
 
-    Reported tolerances are the nominal scientific tolerances (0.05, 0.08,
-    and 0.10 dex).  A 0.0049 dex comparison margin is applied internally so
-    that values which round to the nominal tolerance are not rejected solely
-    because of numerical/rounding effects.
-
-    Rules
-    -----
+    Scientific rules
+    ----------------
     Iterations 2-5
-        All finite species must satisfy |Delta abundance| <= 0.05 dex.
+        All abundance changes must be finite and <= 0.05 dex.
 
     Iterations 6-8
-        The tolerance remains 0.05 dex and at most one finite species may
-        remain above it.
+        All abundance changes must be finite. At most two elements may exceed
+        0.05 dex, provided that none exceeds 0.08 dex.
 
     Iterations 9-12
-        The tolerance is 0.08 dex. At most two finite species may remain above
-        it, and at most one finite species may exceed 0.10 dex.
+        At most two elements may exceed 0.08 dex and at most one may exceed
+        0.10 dex. A current non-finite change is allowed only when that
+        element's most recent earlier finite abundance change is within the
+        current 0.08 dex tolerance.
 
     Iterations 13-15
-        The tolerance is 0.10 dex. At most two finite species may remain above
-        it, with no additional upper-change restriction on those two species.
+        At most two elements may exceed 0.10 dex. A current non-finite change
+        is allowed only when that element's most recent earlier finite
+        abundance change is within the current 0.10 dex tolerance.
 
-    Species above the active tolerance are returned in
-    ``non_converged_indices`` so that the existing late-history median
-    treatment can be applied at finalization. NaN changes are ignored for
-    convergence counting.
+    The 0.0049 dex numerical margin is used only for threshold comparisons.
+    A NaN is never converted to a zero change.
     """
     change = np.asarray(change, dtype=float)
-    finite = np.isfinite(change)
     comparison_epsilon = 0.0049
 
+    def _most_recent_finite_change(species_index: int) -> float:
+        if mean_history is None:
+            return np.nan
+        history = np.asarray(mean_history, dtype=float)
+        if history.ndim != 2 or species_index >= history.shape[0]:
+            return np.nan
+        # Only iterations preceding the current convergence check are eligible.
+        stop = min(max(iteration_id - 1, 0), history.shape[1])
+        values = history[species_index, :stop]
+        for j in range(len(values) - 1, 0, -1):
+            if np.isfinite(values[j]) and np.isfinite(values[j - 1]):
+                return float(abs(values[j] - values[j - 1]))
+        return np.nan
+
+    # Iterations 2-5: strict 0.05 dex and no NaNs.
     if iteration_id < config.intermediate_convergence_start_iteration:
         active_tolerance = config.early_convergence_tolerance
-        non_converged_indices = np.where(
-            finite & (change > active_tolerance + comparison_epsilon)
-        )[0].astype(int).tolist()
-        converged = len(non_converged_indices) == 0
-        return (
-            converged,
-            non_converged_indices,
-            active_tolerance,
-            "strict early convergence",
-        )
+        finite = np.isfinite(change)
+        above = finite & (change > active_tolerance + comparison_epsilon)
+        invalid = ~finite
+        non_converged_indices = np.where(above | invalid)[0].astype(int).tolist()
+        converged = bool(np.all(finite) and not np.any(above))
+        return converged, non_converged_indices, active_tolerance, "strict early convergence"
 
+    # Iterations 6-8: no NaNs; <=2 above 0.05 dex; none above 0.08 dex.
     if iteration_id < config.late_convergence_start_iteration:
         active_tolerance = config.intermediate_convergence_tolerance
-        non_converged_indices = np.where(
-            finite & (change > active_tolerance + comparison_epsilon)
-        )[0].astype(int).tolist()
-        converged = len(non_converged_indices) <= 1
-        return (
-            converged,
-            non_converged_indices,
-            active_tolerance,
-            "intermediate convergence",
+        finite = np.isfinite(change)
+        above_005 = finite & (change > active_tolerance + comparison_epsilon)
+        above_008 = finite & (change > config.late_convergence_tolerance + comparison_epsilon)
+        invalid = ~finite
+        non_converged_indices = np.where(above_005 | invalid)[0].astype(int).tolist()
+        converged = bool(
+            np.all(finite)
+            and int(np.sum(above_005)) <= 2
+            and int(np.sum(above_008)) == 0
         )
+        return converged, non_converged_indices, active_tolerance, "intermediate convergence"
 
+    # From iteration 9 onward, a NaN can be conditionally accepted using the
+    # element's most recent earlier finite abundance change.
     if iteration_id < config.final_convergence_start_iteration:
         active_tolerance = config.late_convergence_tolerance
-        non_converged_indices = np.where(
-            finite & (change > active_tolerance + comparison_epsilon)
-        )[0].astype(int).tolist()
-        n_above_010 = int(
-            np.sum(finite & (change > config.final_convergence_tolerance + comparison_epsilon))
-        )
-        converged = (
-            len(non_converged_indices) <= 2
-            and n_above_010 <= 1
-        )
-        return (
-            converged,
-            non_converged_indices,
-            active_tolerance,
-            "late convergence",
-        )
+        upper_tolerance = config.final_convergence_tolerance
+        max_above_active = 2
+        max_above_upper = 1
+        convergence_mode = "late convergence"
+    else:
+        active_tolerance = config.final_convergence_tolerance
+        upper_tolerance = None
+        max_above_active = 2
+        max_above_upper = None
+        convergence_mode = "final-stage convergence"
 
-    active_tolerance = config.final_convergence_tolerance
-    non_converged_indices = np.where(
-        finite & (change > active_tolerance + comparison_epsilon)
-    )[0].astype(int).tolist()
-    converged = len(non_converged_indices) <= 2
-    return (
-        converged,
-        non_converged_indices,
-        active_tolerance,
-        "final-stage convergence",
+    effective_change = change.copy()
+    unresolved_nan_indices: List[int] = []
+    for species_index in np.where(~np.isfinite(effective_change))[0].astype(int):
+        previous_change = _most_recent_finite_change(species_index)
+        if (
+            np.isfinite(previous_change)
+            and previous_change <= active_tolerance + comparison_epsilon
+        ):
+            # Use the previous finite change only for convergence assessment.
+            # The actual current abundance remains NaN and is not overwritten.
+            effective_change[species_index] = previous_change
+        else:
+            unresolved_nan_indices.append(int(species_index))
+
+    finite_effective = np.isfinite(effective_change)
+    above_active = finite_effective & (
+        effective_change > active_tolerance + comparison_epsilon
     )
+    non_converged_indices = sorted(
+        set(np.where(above_active)[0].astype(int).tolist() + unresolved_nan_indices)
+    )
+
+    converged = (
+        len(unresolved_nan_indices) == 0
+        and int(np.sum(above_active)) <= max_above_active
+    )
+    if upper_tolerance is not None:
+        above_upper = finite_effective & (
+            effective_change > upper_tolerance + comparison_epsilon
+        )
+        converged = converged and int(np.sum(above_upper)) <= int(max_above_upper)
+
+    return bool(converged), non_converged_indices, active_tolerance, convergence_mode
+
 
 def late_history_median(
     history: np.ndarray,
@@ -3211,18 +3239,26 @@ def _format_history_float(value: float) -> str:
 def _abundance_convergence_rule_text(iteration_id: int, config: AutoSpecFitConfig) -> str:
     """Return the nominal, human-readable abundance-convergence rule."""
     if iteration_id < config.intermediate_convergence_start_iteration:
-        return "all elements must have |Delta abundance| <= 0.05 dex"
+        return (
+            "all abundance changes must be finite and |Delta abundance| <= 0.05 dex"
+        )
     if iteration_id < config.late_convergence_start_iteration:
-        return "at most one element may have |Delta abundance| > 0.05 dex"
+        return (
+            "all abundance changes must be finite; at most two elements may have "
+            "|Delta abundance| > 0.05 dex, and none may exceed 0.08 dex"
+        )
     if iteration_id < config.final_convergence_start_iteration:
         return (
-            "at most two elements may have |Delta abundance| > 0.08 dex, "
-            "and no more than one may exceed 0.10 dex"
+            "at most two elements may have |Delta abundance| > 0.08 dex, and no more "
+            "than one may exceed 0.10 dex; a NaN is acceptable only when that element's "
+            "most recent earlier finite abundance change satisfies the 0.08 dex tolerance"
         )
     return (
-        "at most two elements may have |Delta abundance| > 0.10 dex; "
-        "no additional upper-change restriction is applied to those two elements"
+        "at most two elements may have |Delta abundance| > 0.10 dex; a NaN is acceptable "
+        "only when that element's most recent earlier finite abundance change satisfies "
+        "the 0.10 dex tolerance"
     )
+
 
 def _read_parameter_history_rounded_values(
     path: Path,
@@ -6390,6 +6426,7 @@ def run_autospecfit_abundance_pipeline(
                     change,
                     iteration_id,
                     config,
+                    mean_history=mean_history,
                 )
 
                 # Overall convergence ALWAYS requires both abundance and atmospheric-
