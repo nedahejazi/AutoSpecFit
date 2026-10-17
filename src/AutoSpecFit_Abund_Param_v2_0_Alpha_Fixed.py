@@ -171,6 +171,21 @@ Lester, K. V. 2025, AJ, 170, 18
 DOI: 10.3847/1538-3881/add696
 
 """
+# GJ 205 STRICT ACCEPTANCE PROFILE (2026-10-16)
+# ------------------------------------------------
+# Pass 1: independent maximum two-grid-step shift safeguard, plus diagnostic
+# scatter deterioration ratio >=1.5 with the three-condition guard and fallback.
+# Ca abundance jump: >0.15 dex temporarily excludes diagnostic 66 from the
+# next Pass-1 metallicity subset; the original line lists remain unchanged.
+# Pass 2: sensitivity-weighted local fit, accepts any finite fitted parameter
+# without an additional Pass-1-to-Pass-2 distance rejection gate.
+# Parameter convergence: all parameters must remain within one grid step,
+# including iterations >=6. Abundance convergence additionally requires
+# finite measurements in both compared iterations, and overall convergence
+# requires BOTH parameter and abundance criteria. Maximum-iteration
+# finalization is NOT convergence. Existing checkpoint and recovery logic is
+# retained; external Turbospectrum/SLURM execution is not tested here.
+
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -606,9 +621,8 @@ class AutoSpecFitConfig:
     fresh_start_marker_file: str = "ASF_Fresh_Start_Initialized_GJ205_SW_NoCr.txt"
 
     # One-grid-step atmospheric-parameter convergence tolerances. For parameter
-    # iterations 2--5, every fitted parameter must remain within one step. From
-    # iteration 6 onward, at most one fitted parameter may exceed one step, but
-    # that single change must remain within two steps.
+    # every fitted parameter must remain within one step in every iteration.
+    # No relaxed two-step exception is allowed at later iterations.
     teff_convergence_tolerance: float = 50.0
     logg_convergence_tolerance: float = 0.10
     metallicity_convergence_tolerance: float = 0.10
@@ -630,10 +644,20 @@ class AutoSpecFitConfig:
     # consistent than in the preceding parameter iteration. start_iteration=1
     # enables the mechanism from the beginning; iteration 1 establishes the
     # first baseline because no earlier diagnostic scatter exists.
+    # Strict, temporary GJ 205 Pass-1 line safeguard: when the Ca ASF offset
+    # changes by more than 0.15 dex between consecutive completed abundance
+    # iterations, exclude Ca I diagnostic line 66 from the NEXT Pass-1
+    # metallicity fit only. Pass 2 and later iterations keep the line eligible.
+    # This is an explicitly chosen diagnostic safeguard, not a claim that the
+    # line is intrinsically defective. It does not alter abundance line lists.
+    abundance_jump_line_guard_enabled: bool = True
+    abundance_jump_threshold_dex: float = 0.15
+    abundance_jump_ca_metallicity_excluded_lines: Tuple[int, ...] = (66,)
+
     diagnostic_consistency_guard_enabled: bool = True
     diagnostic_consistency_guard_start_iteration: int = 1
     diagnostic_consistency_min_shift_steps: float = 1.0
-    diagnostic_consistency_scatter_ratio: float = 3.0
+    diagnostic_consistency_scatter_ratio: float = 1.5
     diagnostic_consistency_min_current_scatter_steps: float = 1.0
     diagnostic_consistency_history_file: str = "ASF_Parameter_Diagnostic_Consistency_GJ205_SW_NoCr.txt"
 
@@ -2926,11 +2950,8 @@ def parameter_change_is_converged(
 ) -> bool:
     """Evaluate atmospheric-parameter convergence between consecutive cycles.
 
-    For parameter iterations 2--5, all four fitted parameters must change by no
-    more than one adopted grid step.  From parameter iteration 6 onward, at most
-    one parameter may change by more than one grid step, provided that its change
-    is no greater than two grid steps and every other parameter remains within
-    one grid step.
+    All fitted parameters must change by at most one grid step in EVERY
+    iteration; the previous late-stage two-step exception is disabled.
     """
     try:
         changes = np.asarray([
@@ -2953,20 +2974,10 @@ def parameter_change_is_converged(
     ], dtype=float)
     comparison_epsilon = 1.0e-10
 
-    within_one = changes <= (one_step + comparison_epsilon)
-    if iteration_id is None or int(iteration_id) < 6:
-        return bool(np.all(within_one))
-
-    above_one = ~within_one
-    if int(np.sum(above_one)) == 0:
-        return True
-    if int(np.sum(above_one)) > 1:
-        return False
-
-    # From iteration 6 onward, the single parameter outside one grid step may
-    # move by at most two grid steps (e.g. log g 5.2 -> 5.4 for a 0.1-dex grid).
-    idx = int(np.where(above_one)[0][0])
-    return bool(changes[idx] <= (2.0 * one_step[idx] + comparison_epsilon))
+    # Strict GJ 205 policy: no late-iteration two-step exemption. Reject
+    # NaN/Inf, and require EVERY fitted parameter to change by <= one step.
+    # iteration_id is retained for API/checkpoint compatibility.
+    return bool(np.all(np.isfinite(changes)) and np.all(changes <= (one_step + comparison_epsilon)))
 
 
 def write_parameter_history_row(
@@ -4543,6 +4554,70 @@ def _parameter_grid_step(config: AutoSpecFitConfig, parameter_name: str) -> floa
     }[parameter_name]
 
 
+def _abundance_from_history_iteration(path: Path, iteration: int, element: str) -> Optional[float]:
+    """Read an ASF offset from one completed vertical abundance-history block."""
+    if not path.is_file() or iteration < 1:
+        return None
+    import re
+    header = re.compile(r"^Iteration\s+(\d+)\s*$")
+    active = False
+    result = None
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        match = header.match(line)
+        if match:
+            active = int(match.group(1)) == iteration
+            if active:
+                result = None
+            continue
+        if active:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].lower() == element.lower():
+                try:
+                    value = float(parts[1])
+                    if np.isfinite(value):
+                        result = value
+                except ValueError:
+                    pass
+    return result
+
+
+def _temporary_pass1_diagnostic_exclusions(
+    config: AutoSpecFitConfig, parameter_iteration: int
+) -> Dict[str, Tuple[int, ...]]:
+    """Use completed abundance iterations N-2 and N-1 before parameter N."""
+    if not config.abundance_jump_line_guard_enabled or parameter_iteration < 3:
+        return {}
+    path = Path(config.output_dir) / config.abundance_history_file
+    previous = _abundance_from_history_iteration(path, parameter_iteration - 2, "Ca")
+    current = _abundance_from_history_iteration(path, parameter_iteration - 1, "Ca")
+    if previous is None or current is None:
+        LOGGER.warning(
+            "ABUNDANCE JUMP LINE GUARD | parameter iteration %d | missing Ca history; "
+            "no automatic exclusion", parameter_iteration,
+        )
+        return {}
+    jump = current - previous
+    if abs(jump) <= config.abundance_jump_threshold_dex:
+        LOGGER.info(
+            "ABUNDANCE JUMP LINE GUARD | parameter iteration %d | "
+            "Ca change=%+.4f dex <= %.3f dex; no exclusion",
+            parameter_iteration, jump, config.abundance_jump_threshold_dex,
+        )
+        return {}
+    excluded = tuple(config.abundance_jump_ca_metallicity_excluded_lines)
+    LOGGER.warning(
+        "ABUNDANCE JUMP LINE GUARD | parameter iteration %d | "
+        "Ca abundance %+.4f -> %+.4f (change=%+.4f dex, threshold=%.3f); "
+        "temporarily excluding Pass-1 metallicity diagnostic lines %s; "
+        "these lines remain eligible in Pass 2 and future iterations",
+        parameter_iteration, previous, current, jump,
+        config.abundance_jump_threshold_dex, excluded,
+    )
+    return {"metallicity": excluded}
+
+
+
 def _load_diagnostic_consistency_history(config: AutoSpecFitConfig) -> Dict:
     path = Path(config.output_dir) / config.diagnostic_consistency_history_file
     if not path.exists():
@@ -4595,7 +4670,18 @@ def _record_and_test_diagnostic_consistency(
         else np.nan
     )
     finite_line_values = [float(v) for v in np.asarray(line_values, dtype=float) if np.isfinite(v)]
-    reject = bool(
+    # Independent maximum-shift safeguard: reject a Pass-1 proposal that
+    # jumps more than two grid steps even if previous scatter is unavailable.
+    # Smaller shifts are rejected only if ALL three diagnostic-scatter
+    # deterioration conditions are met (one-step movement, one-step scatter,
+    # and a >=1.5-fold increase over the preceding iteration).
+    excessive_pass1_shift = bool(
+        config.diagnostic_consistency_guard_enabled
+        and int(parameter_pass) == 1
+        and int(iteration_id) >= int(config.diagnostic_consistency_guard_start_iteration)
+        and (not np.isfinite(shift_steps) or shift_steps > 2.0 + 1.0e-10)
+    )
+    reject = excessive_pass1_shift or bool(
         config.diagnostic_consistency_guard_enabled
         and int(iteration_id) >= int(config.diagnostic_consistency_guard_start_iteration)
         and int(parameter_pass) == 1
@@ -5265,6 +5351,23 @@ def gj205_parameter_refiner(
         first_pass_real_values[parameter_name] = real_value
         checkpoint_step(step_name)
 
+    # Apply temporary line exclusions to Pass 1 only; do not remove any
+    # diagnostic line from the stored global line selection or from Pass 2.
+    temporary_exclusions = (
+        _temporary_pass1_diagnostic_exclusions(config, iteration_id)
+        if config.run_parameter_pass1 else {}
+    )
+    metallicity_pass1_lines = tuple(
+        line for line in config.metallicity_diagnostic_lines
+        if line not in temporary_exclusions.get("metallicity", ())
+    )
+    if not metallicity_pass1_lines:
+        # Never allow the guard to produce an empty diagnostic fit.
+        LOGGER.warning("ABUNDANCE JUMP GUARD | empty metallicity subset; restoring original")
+        metallicity_pass1_lines = tuple(config.metallicity_diagnostic_lines)
+    elif len(metallicity_pass1_lines) == 1:
+        LOGGER.warning("ABUNDANCE JUMP GUARD | only one metallicity diagnostic remains")
+
     # -------------------- Optional Pass 1 --------------------
     if config.run_parameter_pass1:
         LOGGER.info(
@@ -5275,7 +5378,7 @@ def gj205_parameter_refiner(
         run_pass1_step("p1_vmic", "vmic", selected_lines_override=available_parameter_lines)
         run_pass1_step(
             "p1_metallicity", "metallicity",
-            diagnostic_line_numbers=config.metallicity_diagnostic_lines,
+            diagnostic_line_numbers=metallicity_pass1_lines,
         )
         run_pass1_step(
             "p1_logg", "logg", diagnostic_line_numbers=config.logg_diagnostic_lines
@@ -6428,6 +6531,18 @@ def run_autospecfit_abundance_pipeline(
                     config,
                     mean_history=mean_history,
                 )
+
+                # Strict finite-abundance acceptance: an earlier finite
+                # history value may be used for synthesis recovery, but cannot
+                # make a current undefined abundance count as converged.
+                abundance_values_finite = bool(
+                    np.all(np.isfinite(mean_history[:, iteration_id - 2]))
+                    and np.all(np.isfinite(mean_history[:, iteration_id - 1]))
+                    and np.all(np.isfinite(change))
+                )
+                if not abundance_values_finite:
+                    abundance_criterion_satisfied = False
+                    convergence_mode += " (undefined abundance: convergence blocked)"
 
                 # Overall convergence ALWAYS requires both abundance and atmospheric-
                 # parameter stability. This remains true at the maximum iteration;
